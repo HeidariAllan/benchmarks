@@ -1,6 +1,6 @@
 mne
 moabb
-orion
-orion[profet]
+orion[bohb,profet]
+ConfigSpace==0.7.1
 scikit-learn
 torchinfo

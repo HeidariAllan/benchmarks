@@ -25,7 +25,6 @@ from torchinfo import summary
 import speechbrain as sb
 import yaml
 
-
 class MOABBBrain(sb.Brain):
     def init_model(self, model):
         """Function to initialize neural network modules"""
@@ -103,7 +102,7 @@ class MOABBBrain(sb.Brain):
         if stage != sb.Stage.TRAIN:
             self.preds = []
             self.targets = []
-
+        
     def on_stage_end(self, stage, stage_loss, epoch=None):
         """Gets called at the end of a epoch."""
         if stage == sb.Stage.TRAIN:
@@ -399,7 +398,14 @@ def load_hparams_and_dataset_iterators(hparams_file, run_opts, overrides):
         hyperparams_to_save=hparams_file,
         overrides=overrides,
     )
-
+    
+    if hparams['partial_training']:
+        default_iter = datasets['train'].__iter__
+        def override_iter(self):
+            for _, batch in zip(range(int(hparams['max_num_batches'])), default_iter(self)):
+                yield batch
+        datasets['train'].__iter__ = override_iter
+    
     return hparams, datasets
 
 

@@ -50,12 +50,14 @@ metrics:
     cm: !ref <cm>
 # TRAINING HPARS
 n_train_examples: 100  # it will be replaced in the train script
+partial_training: 0 # @orion_step1: --partial_training=1
+max_num_batches_: 1 # @orion_step1: --max_num_batches_~"fidelity(1, 100, base=4)"
+max_num_batches: !new:int
+    - !apply:math.ceil
+        - !ref <max_num_batches_> / 1000 * <n_train_examples> / <batch_size>
 # checkpoints to average
 avg_models: 10 # @orion_step1: --avg_models~"uniform(1, 15,discrete=True)"
-number_of_epochs_: 200 # @orion_step1: --number_of_epochs~"fidelity(15, 1000, base=4)"
-number_of_epochs: !apply:int
-    - !apply:math.floor
-        - !ref <number_of_epochs_>
+number_of_epochs: 200 # @orion_step1: --number_of_epochs~"loguniform(50, 1000, discrete=True)"
 lr: 0.0001 # @orion_step1: --lr~"choices([0.01, 0.005, 0.001, 0.0005, 0.0001])"
 # Learning rate scheduling (cyclic learning rate is used here)
 max_lr: !ref <lr> # Upper bound of the cycle (max value of the lr)
