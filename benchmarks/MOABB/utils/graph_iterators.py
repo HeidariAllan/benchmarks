@@ -14,8 +14,11 @@ Drew Wagner, 2024
 """
 
 import abc
+from contextlib import redirect_stdout
+from functools import cached_property
 import random
-from typing import Iterable
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -24,12 +27,22 @@ import torch
 from mne import EpochsArray
 from mne.channels import find_ch_adjacency
 from moabb import paradigms
+from moabb.datasets.base import BaseDataset
+from speechbrain.processing.signal_processing import mean_std_norm
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import ChainDataset, IterableDataset
+from torch.utils.data import (
+    ChainDataset,
+    IterableDataset,
+    Dataset,
+    ConcatDataset,
+    Subset,
+)
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 from mne.utils.config import set_config, get_config
+
+from utils.dataio_iterators import get_idx_train_valid_classbalanced
 
 
 def rename_subjects(dataset, subjects):
@@ -342,3 +355,174 @@ class LeaveOneSubjectOut(BaseGraphData):
             else:
                 other.append(d)
         return other, test
+
+
+class TorchMOABBDataset(Dataset):
+    def __init__(
+        self,
+        dataset: BaseDataset,
+        paradigm: paradigms.BaseParadigm,
+        subjects: Optional[Sequence[int]] = None,
+        map_labels: Optional[Dict[str, int]] = None,
+        cache_config: Optional[Dict] = None,
+        head_sphere: tuple = ((0, 0, 0.04), 0.09),  # offset, radius
+        pad_time: Optional[int] = None,
+    ):
+        self.dataset = dataset
+        self.paradigm = paradigm
+        self.subjects = subjects or dataset.subject_list
+        self.map_labels = map_labels
+        self.cache_config = cache_config
+        self.head_sphere = head_sphere
+        self.pad_time = pad_time
+
+    def __len__(self):
+        return len(self._data[0])
+
+    def __getitem__(self, index):
+        X, y, metadata, ch_positions = self._data
+        meta = metadata.iloc[index]  # Corrected to use the current index
+
+        x = X[index]
+        if self.pad_time:
+            assert (
+                self.pad_time >= x.shape[1]
+            ), "Expected T to be less than pad_time"
+            x = torch.nn.functional.pad(
+                x, (0, self.pad_time - x.shape[1], 0, 0)
+            )
+
+        return Data(
+            x=x,
+            y=y[index],
+            pos=ch_positions,
+            subject=meta["subject"],
+            session=meta["session"],
+            run=meta["run"],
+        )
+
+    @cached_property
+    def _data(self):
+        from io import StringIO
+
+        # Suppress all the garbage output from MOABB / MNE
+        with warnings.catch_warnings(), redirect_stdout(StringIO()):
+            warnings.simplefilter("ignore")
+            X, y, metadata = self.paradigm.get_data(
+                self.dataset,
+                subjects=self.subjects,
+                return_epochs=True,
+                cache_config=self.cache_config,
+            )
+
+        # Prepare channel positions
+        offset = torch.tensor(self.head_sphere[0])
+        radius = self.head_sphere[1]
+        ch_positions = (
+            torch.from_numpy(
+                np.array(
+                    list(
+                        X.info.get_montage().get_positions()["ch_pos"].values()
+                    )
+                )
+            )
+            .sub_(offset)
+            .div_(radius)
+            .float()
+            .contiguous()
+        )
+
+        # Prepare features
+        X = torch.from_numpy(X.get_data()).float()
+        X = mean_std_norm(X, dims=(1, 2))
+
+        # Prepare labels
+        y = pd.Series(y)
+        if self.map_labels:
+            y = y.replace(self.map_labels)
+        else:
+            y = y.replace(self.dataset.event_id) - 1
+        # Ensures that all labels were converted:
+        y = pd.to_numeric(y, errors="coerce")
+        if y.isna().any():
+            if self.map_labels and "_default" in self.map_labels:
+                y = y.fillna(self.map_labels["_default"])
+            else:
+                raise ValueError(
+                    "unconverted labels, did you setup map_labels correctly?"
+                )
+        y = y.astype(int)
+        y = torch.from_numpy(y.values)
+
+        # Convert session and run names to categorical indices
+        metadata["session"], self._session_names = metadata[
+            "session"
+        ].factorize(sort=True)
+        metadata["run"], self._run_names = metadata["run"].factorize(sort=True)
+
+        return X, y, metadata, ch_positions
+
+
+class LeaveOneDatasetOut:
+
+    def prepare(
+        self,
+        *,
+        datasets: List[BaseDataset],
+        paradigm_cls,
+        batch_size: int,
+        valid_ratio: float,
+        pad_time_to: int,
+        target_dataset_idx: int,
+        map_labels=None,
+        cache_config=None,
+    ):
+        train_ds = []
+        test_ds = []
+        for i, dataset in enumerate(datasets):
+            ds = TorchMOABBDataset(
+                dataset=dataset,
+                paradigm=paradigm_cls(),
+                cache_config=cache_config,
+                map_labels=map_labels,
+                pad_time=pad_time_to,
+            )
+            if i == target_dataset_idx:
+                test_ds.append(ds)
+            else:
+                train_ds.append(ds)
+
+        train_ds = ConcatDataset(train_ds)
+        test_ds = ConcatDataset(test_ds)
+
+        y = np.array([s.y for s in train_ds])
+
+        train_idx, valid_idx = get_idx_train_valid_classbalanced(
+            range(len(train_ds)), valid_ratio, y
+        )
+        train_ds, valid_ds = Subset(train_ds, train_idx), Subset(
+            train_ds, valid_idx
+        )
+
+        exclude_keys = ["subject", "session", "run"]
+        train = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            pin_memory=True,
+            shuffle=True,
+            exclude_keys=exclude_keys,
+        )
+        valid = DataLoader(
+            valid_ds,
+            batch_size=batch_size,
+            pin_memory=True,
+            exclude_keys=exclude_keys,
+        )
+        test = DataLoader(
+            test_ds,
+            batch_size=batch_size,
+            pin_memory=True,
+            exclude_keys=exclude_keys,
+        )
+
+        return {"train": train, "valid": valid, "test": test}

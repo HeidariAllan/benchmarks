@@ -26,7 +26,11 @@ from hyperpyyaml import load_hyperpyyaml
 from torch.nn import init
 from torch_geometric.data import Batch
 
-from utils.graph_iterators import LeaveOneSessionOut, LeaveOneSubjectOut
+from utils.graph_iterators import (
+    LeaveOneDatasetOut,
+    LeaveOneSessionOut,
+    LeaveOneSubjectOut,
+)
 
 
 class MOABBBrain(sb.Brain):
@@ -345,45 +349,60 @@ def prepare_dataset_iterators(hparams):
     """Preprocesses the dataset and partitions it into train, valid and test sets."""
     # defining data iterator to use
     print("Prepare dataset iterators...")
-    if hparams["data_iterator_name"] == "leave-one-session-out":
-        DataIterator = LeaveOneSessionOut
-    elif hparams["data_iterator_name"] == "leave-one-subject-out":
-        DataIterator = LeaveOneSubjectOut
-    else:
-        raise ValueError(
-            "Unknown data_iterator_name: %s" % hparams["data_iterator_name"]
+    DataIterator = {
+        "leave-one-session-out": LeaveOneSessionOut,
+        "leave-one-subject-out": LeaveOneSubjectOut,
+        "leave-one-dataset-out": LeaveOneDatasetOut,
+    }[hparams["data_iterator_name"]]
+
+    if DataIterator == LeaveOneDatasetOut:
+        datasets = DataIterator().prepare(
+            datasets=hparams["datasets"],
+            paradigm_cls=hparams["paradigm"],
+            batch_size=hparams["batch_size"],
+            valid_ratio=hparams["valid_ratio"],
+            pad_time_to=hparams["T"],
+            target_dataset_idx=hparams["target_dataset_idx"],
+            map_labels=hparams.get("map_labels"),
+            cache_config=hparams.get("cache_config"),
         )
-
-    data_iterator = DataIterator(
-        datasets=hparams["datasets"],
-        resample=hparams["sample_rate"],
-        fmin=hparams["fmin"],
-        fmax=hparams["fmax"],
-        tmin=hparams["tmin"],
-        tmax=hparams["tmax"],
-        events=hparams["events_to_load"],
-        valid_ratio=hparams["valid_ratio"],
-        target_subjects=hparams["target_subject_idx"] + 1,
-        target_sessions=hparams["target_session_idx"],
-    )
-
-    datasets = data_iterator.prepare(
-        data_folder=hparams["data_folder"],
-        cached_data_folder=hparams["cached_data_folder"],
-        batch_size=hparams["batch_size"],
-    )
-
-    tail_path = os.path.join(
-        hparams["data_iterator_name"],
-        "_".join(
-            "sub-{0}".format(str(subject).zfill(3))
-            for subject in data_iterator.target_subjects
-        ),
-    )
-    if data_iterator.target_session_names is not None:
         tail_path = os.path.join(
-            tail_path, "_".join(map(str, data_iterator.target_session_names))
+            hparams["data_iterator_name"],
+            "_ds-{0}".format(str(hparams["target_dataset_idx"]).zfill(3)),
         )
+    else:
+        data_iterator = DataIterator(
+            datasets=hparams["datasets"],
+            resample=hparams["sample_rate"],
+            fmin=hparams["fmin"],
+            fmax=hparams["fmax"],
+            tmin=hparams["tmin"],
+            tmax=hparams["tmax"],
+            events=hparams["events_to_load"],
+            valid_ratio=hparams["valid_ratio"],
+            target_subjects=hparams["target_subject_idx"] + 1,
+            target_sessions=hparams["target_session_idx"],
+        )
+
+        datasets = data_iterator.prepare(
+            data_folder=hparams["data_folder"],
+            cached_data_folder=hparams["cached_data_folder"],
+            batch_size=hparams["batch_size"],
+        )
+
+        tail_path = os.path.join(
+            hparams["data_iterator_name"],
+            "_".join(
+                "sub-{0}".format(str(subject).zfill(3))
+                for subject in data_iterator.target_subjects
+            ),
+        )
+        if data_iterator.target_session_names is not None:
+            tail_path = os.path.join(
+                tail_path,
+                "_".join(map(str, data_iterator.target_session_names)),
+            )
+
     return tail_path, datasets
 
 
@@ -397,10 +416,12 @@ def load_hparams_and_dataset_iterators(hparams_file, run_opts, overrides):
     tail_path, datasets = prepare_dataset_iterators(hparams)
     # override C and T, to be sure that network input shape matches the dataset (e.g., after time cropping or channel sampling)
     overrides.update(
-        T=datasets["T"],
-        C=datasets["C"],
         n_train_examples=len(datasets["train"].dataset),
     )
+    if datasets.get("C") is not None:
+        overrides.update(C=datasets["C"])
+    if datasets.get("T") is not None:
+        overrides.update(C=datasets["T"])
 
     # loading hparams for the each training and evaluation processes
     with open(hparams_file) as fin:

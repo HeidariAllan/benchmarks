@@ -23,7 +23,11 @@ import torch
 import torch_geometric.data
 import torch_geometric.loader
 from moabb.datasets.base import BaseDataset as MOABBDataset
-from torch.utils.data import DataLoader, IterableDataset, TensorDataset
+from torch.utils.data import (
+    DataLoader,
+    IterableDataset,
+    TensorDataset,
+)
 from utils.prepare import prepare_data
 
 
@@ -66,7 +70,12 @@ def get_dataloader(batch_size, xy_train, xy_valid, xy_test):
 
     inps = torch.Tensor(
         x_train.reshape(
-            (x_train.shape[0], x_train.shape[1], x_train.shape[2], 1,)
+            (
+                x_train.shape[0],
+                x_train.shape[1],
+                x_train.shape[2],
+                1,
+            )
         )
     )
     tgts = torch.tensor(y_train, dtype=torch.long)
@@ -77,7 +86,12 @@ def get_dataloader(batch_size, xy_train, xy_valid, xy_test):
 
     inps = torch.Tensor(
         x_valid.reshape(
-            (x_valid.shape[0], x_valid.shape[1], x_valid.shape[2], 1,)
+            (
+                x_valid.shape[0],
+                x_valid.shape[1],
+                x_valid.shape[2],
+                1,
+            )
         )
     )
     tgts = torch.tensor(y_valid, dtype=torch.long)
@@ -85,7 +99,14 @@ def get_dataloader(batch_size, xy_train, xy_valid, xy_test):
     valid_loader = DataLoader(ds, batch_size=batch_size, pin_memory=True)
 
     inps = torch.Tensor(
-        x_test.reshape((x_test.shape[0], x_test.shape[1], x_test.shape[2], 1,))
+        x_test.reshape(
+            (
+                x_test.shape[0],
+                x_test.shape[1],
+                x_test.shape[2],
+                1,
+            )
+        )
     )
     tgts = torch.tensor(y_test, dtype=torch.long)
     ds = TensorDataset(inps, tgts)
@@ -195,8 +216,7 @@ class DataLoaderFactory(Protocol):
         n_steps_channel_selection: Optional[int] = None,
         events_to_load: Optional[List[str]] = None,
         save_prepared_dataset: bool = True,
-    ) -> Tuple[str, _SplitDataloaders]:
-        ...
+    ) -> Tuple[str, _SplitDataloaders]: ...
 
 
 class BaseDataIOIterator(DataLoaderFactory, abc.ABC):
@@ -406,7 +426,8 @@ class BaseDataIOIterator(DataLoaderFactory, abc.ABC):
         """Returns the tail path for the directory."""
 
         tail_path = os.path.join(
-            self.iterator_tag, "sub-{0}".format(str(subject).zfill(3)),
+            self.iterator_tag,
+            "sub-{0}".format(str(subject).zfill(3)),
         )
         if session is not None:
             tail_path = os.path.join(tail_path, session)
@@ -560,9 +581,10 @@ class LeaveOneSessionOut(BaseDataIOIterator):
             # obtaining indices for the current session
             idx = np.where(metadata.session == s)[0]
             # validation set definition (equal proportion btw classes)
-            (tmp_idx_train, tmp_idx_valid,) = get_idx_train_valid_classbalanced(
-                idx, valid_ratio, y
-            )
+            (
+                tmp_idx_train,
+                tmp_idx_valid,
+            ) = get_idx_train_valid_classbalanced(idx, valid_ratio, y)
             idx_train.extend(tmp_idx_train)
             idx_valid.extend(tmp_idx_valid)
 
@@ -719,7 +741,14 @@ class LeaveOneSubjectOut(BaseDataIOIterator):
 
         return (
             target_data_dict,
-            (x_train, y_train, x_valid, y_valid, x_test, y_test,),
+            (
+                x_train,
+                y_train,
+                x_valid,
+                y_valid,
+                x_test,
+                y_test,
+            ),
         )
 
     def _validate_dataset_or_raise(self, dataset: MOABBDataset):
