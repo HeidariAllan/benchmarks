@@ -29,7 +29,7 @@ target_dataset_idx: !PLACEHOLDER
 sample_rate: 128 # Target sampling rate (Hz)
 # band-pass filtering cut-off frequencies
 fmin: 0.13 # orion_step1: --fmin~"uniform(0.1, 5, precision=2)"
-fmax: 46.0 # @orion_step1: --fmax~"uniform(20.0, 50.0, precision=3)"
+fmax: 46.0 # orion_step1: --fmax~"uniform(20.0, 50.0, precision=3)"
 n_classes: 3
 map_labels:
   left_hand: 0
@@ -40,7 +40,7 @@ map_labels:
 # dataset interval starts from 2
 # -->tmin tmax are referred to this start value (e.g., tmin=0.5 corresponds to 2.5 s)
 tmin: 0.
-tmax: 4.0 # @orion_step1: --tmax~"uniform(1.0, 4.0, precision=2)"
+tmax: 4.0 # orion_step1: --tmax~"uniform(1.0, 4.0, precision=2)"
 paradigm: !name:moabb.paradigms.MotorImagery
   tmin: !ref <tmin>
   tmax: !ref <tmax>
@@ -70,8 +70,8 @@ metrics:
 n_train_examples: 100 # it will be replaced in the train script
 # checkpoints to average
 avg_models: 10 # @orion_step1: --avg_models~"uniform(1, 15,discrete=True)"
-number_of_epochs: 862 # @orion_step1: --number_of_epochs~"uniform(500, 1000, discrete=True)"
-lr: 0.0001 # orion_step1: --lr~"choices([0.01, 0.005, 0.001, 0.0005, 0.0001])"
+number_of_epochs: 15 # @orion_step1: --number_of_epochs~"fidelity(3, 100, base=4)"
+lr: 0.001 # orion_step1: --lr~"choices([0.5, 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001])"
 # Learning rate scheduling (cyclic learning rate is used here)
 max_lr: !ref <lr> # Upper bound of the cycle (max value of the lr)
 base_lr: 0.00000001 # Lower bound in the cycle (min value of the lr)
@@ -88,7 +88,8 @@ loss: !name:speechbrain.nnet.losses.nll_loss
 optimizer: !name:torch.optim.Adam
   lr: !ref <lr>
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter # epoch counter
-  limit: !ref <number_of_epochs>
+  limit: !new:int
+    - !ref <number_of_epochs>
 batch_size_exponent: 4 # @orion_step1: --batch_size_exponent~"uniform(4, 6,discrete=True)"
 batch_size: !ref 2 ** <batch_size_exponent>
 valid_ratio: 0.2
@@ -122,14 +123,14 @@ snr_white_high: !ref <snr_white_low> + <snr_white_delta>
 add_noise_white: !new:speechbrain.augment.time_domain.AddNoise
   snr_low: !ref <snr_white_low>
   snr_high: !ref <snr_white_high>
-position_noise_sigma: 0.01 # @orion_step1: --position_noise_sigma~"uniform(0.0, 0.1, precision=4)"
+position_noise_sigma: 0.1 # @orion_step1: --position_noise_sigma~"uniform(0.0, 0.1, precision=4)"
 
-repeat_augment: 1 # @orion_step1: --repeat_augment 0
+repeat_augment: 0 # @orion_step1: --repeat_augment 0
 graph_augment: !new:torch.nn.Sequential
   - !new:utils.graph_iterators.PositionNoise
     sigma: !ref <position_noise_sigma>
   - !new:utils.graph_iterators.NodeDrop
-    choose_k: 17
+    drop_k: 0.2
 augment: !new:speechbrain.augment.augmenter.Augmenter
   parallel_augment: True
   concat_original: True
@@ -148,12 +149,12 @@ normalize: !name:speechbrain.processing.signal_processing.mean_std_norm
 pos_normalize: True
 
 # MODEL
-projection_dim: 22 # @orion_step1: --projection_dim~"uniform(4, 44, discrete=True)"
-spatial_focus_tau: 0.3333 # @orion_step1: --spatial_focus_tau~"uniform(0.01, 1.0, precision=4)"
+projection_dim: 22 # @orion_step1: --projection_dim~"loguniform(4, 44, discrete=True)"
+spatial_focus_tau: 0.3333 # @orion_step1: --spatial_focus_tau~"loguniform(0.01, 1.0, precision=4)"
 
 input_shape: [null, !ref <T>, !ref <projection_dim>, null]
-cnn_temporal_kernels: 61 # @orion_step1: --cnn_temporal_kernels~"uniform(32, 72,discrete=True)"
-cnn_temporal_kernelsize: 51 # @orion_step1: --cnn_temporal_kernelsize~"uniform(24, 62,discrete=True)"
+cnn_temporal_kernels: 61 # @orion_step1: --cnn_temporal_kernels~"loguniform(32, 72,discrete=True)"
+cnn_temporal_kernelsize: 51 # @orion_step1: --cnn_temporal_kernelsize~"loguniform(24, 62,discrete=True)"
 # depth multiplier for the spatial depthwise conv. layer
 cnn_spatial_depth_multiplier: 4 # @orion_step1: --cnn_spatial_depth_multiplier~"uniform(1, 4,discrete=True)"
 cnn_spatial_max_norm: 1. # kernel max-norm constaint of the spatial depthwise conv. layer
@@ -165,7 +166,7 @@ cnn_septemporal_point_kernels_ratio: !ref <cnn_septemporal_point_kernels_ratio_>
 cnn_septemporal_point_kernels_: !ref <cnn_temporal_kernels> * <cnn_spatial_depth_multiplier> * <cnn_septemporal_depth_multiplier>
 cnn_septemporal_point_kernels: !apply:math.ceil
   - !ref <cnn_septemporal_point_kernels_ratio> * <cnn_septemporal_point_kernels_> + 1
-cnn_septemporal_kernelsize_: 15 # @orion_step1: --cnn_septemporal_kernelsize_~"uniform(3, 24,discrete=True)"
+cnn_septemporal_kernelsize_: 15 # @orion_step1: --cnn_septemporal_kernelsize_~"loguniform(3, 24,discrete=True)"
 max_cnn_spatial_pool: 4
 cnn_septemporal_kernelsize: !apply:round
   - !ref <cnn_septemporal_kernelsize_> * <max_cnn_spatial_pool> / <cnn_spatial_pool>

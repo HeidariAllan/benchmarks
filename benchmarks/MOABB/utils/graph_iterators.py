@@ -16,6 +16,7 @@ Drew Wagner, 2024
 import abc
 from contextlib import redirect_stdout
 from functools import cached_property
+from math import ceil, floor
 import random
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import warnings
@@ -87,15 +88,23 @@ class PositionNoise(nn.Module):
 
 
 class NodeDrop(nn.Module):
-    def __init__(self, choose_k):
+    def __init__(self, choose_k=None, drop_k=None):
         super().__init__()
-        self.k = choose_k
+        assert not (choose_k and drop_k) and (
+            choose_k or drop_k
+        ), "Exactly one of choose_k or drop_k must be passed"
+        self.choose_k = choose_k
+        self.drop_k = drop_k
 
     def forward(self, x):
         del x.edge_index
         x = x.to_data_list()
         for d in x:
-            mask = torch.randperm(d.x.shape[0], device=d.x.device)[: self.k]
+            mask = torch.randperm(d.x.shape[0], device=d.x.device)
+            if self.choose_k:
+                mask = mask[: int(ceil(self.choose_k*d.x.shape[0]))]
+            else:
+                mask = mask[int(floor(self.drop_k*d.x.shape[0])):]
             d.x = d.x[mask, :]
             d.pos = d.pos[mask, :]
 
@@ -385,9 +394,7 @@ class TorchMOABBDataset(Dataset):
 
         x = X[index]
         if self.pad_time:
-            assert (
-                self.pad_time >= x.shape[1]
-            ), "Expected T to be less than pad_time"
+            x = x[:, : self.pad_time]
             x = torch.nn.functional.pad(
                 x, (0, self.pad_time - x.shape[1], 0, 0)
             )

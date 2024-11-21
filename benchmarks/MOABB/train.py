@@ -433,14 +433,7 @@ def load_hparams_and_dataset_iterators(hparams_file, run_opts, overrides):
         hyperparams_to_save=hparams_file,
         overrides=overrides,
     )
-    
-    if hparams['partial_training']:
-        default_iter = datasets['train'].__iter__
-        def override_iter(self):
-            for _, batch in zip(range(int(hparams['max_num_batches'])), default_iter(self)):
-                yield batch
-        datasets['train'].__iter__ = override_iter
-    
+        
     return hparams, datasets
 
 
