@@ -1,6 +1,6 @@
 mne
 moabb
-orion[profet, bohb]
+orion[bohb,profet]
 ConfigSpace==0.7.1
 scikit-learn
 torch_geometric

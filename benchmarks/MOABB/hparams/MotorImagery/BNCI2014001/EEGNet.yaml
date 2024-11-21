@@ -52,7 +52,10 @@ metrics:
 n_train_examples: 100  # it will be replaced in the train script
 # checkpoints to average
 avg_models: 10 # @orion_step1: --avg_models~"uniform(1, 15,discrete=True)"
-number_of_epochs: 862 # @orion_step1: --number_of_epochs~"uniform(250, 1000, discrete=True)"
+number_of_epochs_: 200 # @orion_step1: --number_of_epochs~"fidelity(15, 1000, base=4)"
+number_of_epochs: !apply:int
+    - !apply:math.floor
+        - !ref <number_of_epochs_>
 lr: 0.0001 # @orion_step1: --lr~"choices([0.01, 0.005, 0.001, 0.0005, 0.0001])"
 # Learning rate scheduling (cyclic learning rate is used here)
 max_lr: !ref <lr> # Upper bound of the cycle (max value of the lr)
@@ -77,12 +80,12 @@ valid_ratio: 0.2
 
 # DATA AUGMENTATION
 # cutcat (disabled when min_num_segments=max_num_segments=1)
-max_num_segments: 3 # @orion_step2: --max_num_segments~"uniform(2, 6, discrete=True)"
+max_num_segments: 3 # orion_step2: --max_num_segments~"uniform(2, 6, discrete=True)"
 cutcat: !new:speechbrain.augment.time_domain.CutCat
     min_num_segments: 2
     max_num_segments: !ref <max_num_segments>
 # random amplitude gain between 0.5-1.5 uV (disabled when amp_delta=0.)
-amp_delta: 0.01742 # @orion_step2: --amp_delta~"uniform(0.0, 0.5)"
+amp_delta: 0.01742 # orion_step2: --amp_delta~"uniform(0.0, 0.5)"
 rand_amp: !new:speechbrain.augment.time_domain.RandAmp
     amp_low: !ref 1 - <amp_delta>
     amp_high: !ref 1 + <amp_delta>
@@ -98,14 +101,14 @@ time_shift: !new:speechbrain.augment.freq_domain.RandomShift
     max_shift: !ref <max_shift>
     dim: 1
 # injection of gaussian white noise
-snr_white_low: 15.0 # @orion_step2: --snr_white_low~"uniform(0.0, 15, precision=2)"
-snr_white_delta: 19.1 # @orion_step2: --snr_white_delta~"uniform(5.0, 20.0, precision=3)"
+snr_white_low: 15.0 # orion_step2: --snr_white_low~"uniform(0.0, 15, precision=2)"
+snr_white_delta: 19.1 # orion_step2: --snr_white_delta~"uniform(5.0, 20.0, precision=3)"
 snr_white_high: !ref <snr_white_low> + <snr_white_delta>
 add_noise_white: !new:speechbrain.augment.time_domain.AddNoise
     snr_low: !ref <snr_white_low>
     snr_high: !ref <snr_white_high>
 
-repeat_augment: 1 # @orion_step1: --repeat_augment 0
+repeat_augment: 0 # @orion_step1: --repeat_augment 0
 augment: !new:speechbrain.augment.augmenter.Augmenter
     parallel_augment: True
     concat_original: True
