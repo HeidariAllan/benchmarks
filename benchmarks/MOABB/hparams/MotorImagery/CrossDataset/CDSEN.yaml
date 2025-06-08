@@ -1,0 +1,189 @@
+seed: 1234
+__set_torchseed: !apply:torch.manual_seed [!ref <seed>]
+
+# DIRECTORIES
+# data_folder and cached_data_folder should be overridden from CLI
+output_folder: !PLACEHOLDER
+
+# DATASET HPARS
+datasets:
+  - !new:moabb.datasets.BNCI2014_001
+  - !new:moabb.datasets.BNCI2014_004
+  - !new:moabb.datasets.BNCI2015_001
+  - !new:moabb.datasets.Lee2019_MI
+
+data_iterator_name: multi-dataset-leave-one-subject-out
+target_subject_idx: [0, 0, 0, 0]  # Leave out the first subject from each dataset
+
+cache_config:
+  save_epochs: true
+  use: true
+
+sample_rate: 128
+fmin: 0.13
+fmax: 46.0
+n_classes: 3
+
+map_labels:
+  left_hand: 0
+  right_hand: 1
+  _default: 2
+
+tmin: 0.0
+tmax: 4.0
+paradigm: !name:moabb.paradigms.MotorImagery
+  tmin: !ref <tmin>
+  tmax: !ref <tmax>
+  fmin: !ref <fmin>
+  fmax: !ref <fmax>
+  resample: !ref <sample_rate>
+
+T: !apply:math.ceil
+  - !ref <sample_rate> * (<tmax> - <tmin>)
+
+test_with: "last"
+test_key: "acc"
+
+# METRICS
+f1: !name:sklearn.metrics.f1_score
+  average: "macro"
+acc: !name:sklearn.metrics.balanced_accuracy_score
+cm: !name:sklearn.metrics.confusion_matrix
+metrics:
+  f1: !ref <f1>
+  acc: !ref <acc>
+  cm: !ref <cm>
+
+# TRAINING HPARS
+n_train_examples: 100
+avg_models: 10
+number_of_epochs: 15
+lr: 0.001
+max_lr: !ref <lr>
+base_lr: 0.00000001
+step_size_multiplier: 5
+step_size: !apply:round
+  - !ref <step_size_multiplier> * <n_train_examples> / <batch_size>
+
+lr_annealing: !new:speechbrain.nnet.schedulers.CyclicLRScheduler
+  base_lr: !ref <base_lr>
+  max_lr: !ref <max_lr>
+  step_size: !ref <step_size>
+
+label_smoothing: 0.0
+loss: !name:speechbrain.nnet.losses.nll_loss
+  label_smoothing: !ref <label_smoothing>
+
+optimizer: !name:torch.optim.Adam
+  lr: !ref <lr>
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+  limit: !new:int
+    - !ref <number_of_epochs>
+
+batch_size_exponent: 4
+batch_size: !ref 2 ** <batch_size_exponent>
+valid_ratio: 0.2
+
+# DATA AUGMENTATION
+max_num_segments: 3
+cutcat: !new:speechbrain.augment.time_domain.CutCat
+  min_num_segments: 2
+  max_num_segments: !ref <max_num_segments>
+
+amp_delta: 0.01742
+rand_amp: !new:speechbrain.augment.time_domain.RandAmp
+  amp_low: !ref 1 - <amp_delta>
+  amp_high: !ref 1 + <amp_delta>
+
+shift_delta_: 1
+shift_delta: !ref 1e-2 * <shift_delta_>
+min_shift: !apply:math.floor
+  - !ref 0 - <sample_rate> * <shift_delta>
+max_shift: !apply:math.floor
+  - !ref 0 + <sample_rate> * <shift_delta>
+time_shift: !new:speechbrain.augment.freq_domain.RandomShift
+  min_shift: !ref <min_shift>
+  max_shift: !ref <max_shift>
+  dim: 1
+
+snr_white_low: 15.0
+snr_white_delta: 19.1
+snr_white_high: !ref <snr_white_low> + <snr_white_delta>
+add_noise_white: !new:speechbrain.augment.time_domain.AddNoise
+  snr_low: !ref <snr_white_low>
+  snr_high: !ref <snr_white_high>
+
+position_noise_sigma: 0.1
+
+repeat_augment: 0
+graph_augment: !new:torch.nn.Sequential
+  - !new:utils.graph_iterators.PositionNoise
+    sigma: !ref <position_noise_sigma>
+  - !new:utils.graph_iterators.NodeDrop
+    drop_k: 0.2
+
+augment: !new:speechbrain.augment.augmenter.Augmenter
+  parallel_augment: True
+  concat_original: True
+  parallel_augment_fixed_bs: True
+  repeat_augment: !ref <repeat_augment>
+  shuffle_augmentations: True
+  min_augmentations: 4
+  max_augmentations: 4
+  augmentations:
+    [!ref <cutcat>, !ref <rand_amp>, !ref <time_shift>, !ref <add_noise_white>]
+
+# DATA NORMALIZATION
+dims_to_normalize: 1
+normalize: !name:speechbrain.processing.signal_processing.mean_std_norm
+  dims: !ref <dims_to_normalize>
+pos_normalize: True
+
+# MODEL
+projection_dim: 22
+spatial_focus_tau: 0.3333
+input_shape: [null, !ref <T>, !ref <projection_dim>, null]
+
+cnn_temporal_kernels: 61
+cnn_temporal_kernelsize: 51
+cnn_spatial_depth_multiplier: 4
+cnn_spatial_max_norm: 1.
+cnn_spatial_pool: 4
+cnn_septemporal_depth_multiplier: 1
+cnn_septemporal_point_kernels_ratio_: 7
+cnn_septemporal_point_kernels_ratio: !ref <cnn_septemporal_point_kernels_ratio_> / 4
+cnn_septemporal_point_kernels_: !ref <cnn_temporal_kernels> * <cnn_spatial_depth_multiplier> * <cnn_septemporal_depth_multiplier>
+cnn_septemporal_point_kernels: !apply:math.ceil
+  - !ref <cnn_septemporal_point_kernels_ratio> * <cnn_septemporal_point_kernels_> + 1
+cnn_septemporal_kernelsize_: 15
+max_cnn_spatial_pool: 4
+cnn_septemporal_kernelsize: !apply:round
+  - !ref <cnn_septemporal_kernelsize_> * <max_cnn_spatial_pool> / <cnn_spatial_pool>
+cnn_septemporal_pool: 7
+cnn_pool_type: "avg"
+dense_max_norm: 0.25
+dropout: 0.008464
+activation_type: "elu"
+
+model: !new:models.SpatialEEGNet.SpatialEEGNet
+  C: !ref <projection_dim>
+  T: !ref <T>
+  cnn_temporal_kernels: !ref <cnn_temporal_kernels>
+  cnn_temporal_kernelsize: [!ref <cnn_temporal_kernelsize>, 1]
+  cnn_spatial_depth_multiplier: !ref <cnn_spatial_depth_multiplier>
+  cnn_spatial_max_norm: !ref <cnn_spatial_max_norm>
+  cnn_spatial_pool: [!ref <cnn_spatial_pool>, 1]
+  cnn_septemporal_depth_multiplier: !ref <cnn_septemporal_depth_multiplier>
+  cnn_septemporal_point_kernels: !ref <cnn_septemporal_point_kernels>
+  cnn_septemporal_kernelsize: [!ref <cnn_septemporal_kernelsize>, 1]
+  cnn_septemporal_pool: [!ref <cnn_septemporal_pool>, 1]
+  cnn_pool_type: !ref <cnn_pool_type>
+  activation_type: !ref <activation_type>
+  spatial_focus: !new:models.SpatialEEGNet.SpatialFocus
+    projection_dim: !ref <projection_dim>
+    position_dim: 3
+    tau: !ref <spatial_focus_tau>
+  dense_max_norm: !ref <dense_max_norm>
+  dropout: !ref <dropout>
+  dense_n_neurons: !ref <n_classes>
