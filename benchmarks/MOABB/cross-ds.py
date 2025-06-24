@@ -1,7 +1,7 @@
-import random
 import logging
-from typing import Optional, Sequence, Dict, Tuple
-import pathlib as pl
+import random
+import math
+from typing import Sequence, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -9,37 +9,28 @@ import torch
 from torch.utils.data import ConcatDataset, Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
+from hyperpyyaml import load_hyperpyyaml
 
 from moabb.datasets import BNCI2014_001, Cho2017, PhysionetMI
-from moabb.datasets.base import BaseDataset
 from moabb.paradigms import MotorImagery
-from moabb.paradigms.base import BaseParadigm
 from speechbrain.processing.signal_processing import mean_std_norm
-from speechbrain.nnet.losses import nll_loss
-from models.SpatialEEGNet import SpatialEEGNet, SpatialFocus
+from sklearn.metrics import classification_report, balanced_accuracy_score
 
-# =============== Config ===============
-SEED = 1234
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-PREPROCESSING_PARAMS = {"fmin": 0.1, "fmax": 50.0, "resample": 128}
-CACHE_CONFIG = {"save_epochs": True, "use": True}
-PAD_TIME = 513
-N_CLASSES = 3
-BATCH_SIZE = 8
-NUM_EPOCHS = 20
-WORKING_DIR = "results/loso_experiment"
-pl.Path(WORKING_DIR).mkdir(parents=True, exist_ok=True)
-
-# =============== Logging ===============
+# =====================
+# Logging Setup
+# =====================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# =============== Dataset Wrapper ===============
+
+# =====================
+# Dataset Wrapper
+# =====================
 class TorchMOABBDataset(Dataset):
     def __init__(
         self,
-        dataset: BaseDataset,
-        paradigm: BaseParadigm,
+        dataset,
+        paradigm,
         subjects: Optional[Sequence[int]] = None,
         map_labels: Optional[Dict[str, int]] = None,
         cache_config: Optional[Dict] = None,
@@ -83,149 +74,160 @@ class TorchMOABBDataset(Dataset):
         X = mean_std_norm(X, dims=(1, 2))
 
         y = pd.Series(y)
-        y = y.replace(self.map_labels or self.dataset.event_id) - 1
-        y = torch.from_numpy(pd.to_numeric(y, errors="raise").values)
+        label_map = self.map_labels or self.dataset.event_id
+        y = y.replace(label_map).astype(int)
+        y = torch.from_numpy(y.values)
 
-        metadata["session"], _ = metadata["session"].factorize(sort=True)
-        metadata["run"], _ = metadata["run"].factorize(sort=True)
+        metadata["session"], _ = metadata["session"].factorize()
+        metadata["run"], _ = metadata["run"].factorize()
 
         self.X, self.y, self.metadata, self.ch_positions = X, y, metadata, ch_positions
 
     def __len__(self):
         return len(self.X)
 
-    def __getitem__(self, index):
-        x = self.X[index]
+    def __getitem__(self, idx):
+        x = self.X[idx]
         if self.pad_time:
             x = torch.nn.functional.pad(x, (0, self.pad_time - x.shape[1], 0, 0))
-
-        meta = self.metadata.iloc[index]
+        meta = self.metadata.iloc[idx]
         return Data(
-            x=x.to(DEVICE),
-            y=self.y[index].to(DEVICE),
-            pos=self.ch_positions.to(DEVICE),
+            x=x.to(self.X.device),
+            y=self.y[idx].to(self.y.device),
+            pos=self.ch_positions.to(self.X.device),
             subject=meta["subject"],
             session=meta["session"],
             run=meta["run"],
         )
 
-# =============== Prepare LOSO Datasets ===============
-def prepare_datasets_with_loso() -> Tuple[ConcatDataset, ConcatDataset]:
-    paradigm = MotorImagery(**PREPROCESSING_PARAMS)
 
-    datasets = [
-        BNCI2014_001(),
-        Cho2017(),
-        PhysionetMI()
-    ]
+# =====================
+# Prepare LOSO Split
+# =====================
+def prepare_datasets_loso(hparams) -> (ConcatDataset, ConcatDataset):
+    paradigm = hparams["paradigm"]
+    dataset_classes = hparams["datasets"]
+    label_maps = hparams["label_maps"]
+    cache_config = hparams["cache_config"]
+    pad_time = hparams["pad_time"]
 
-    label_maps = [
-        dict(left_hand=0, right_hand=1, feet=2, tongue=2),
-        dict(left_hand=0, right_hand=1),
-        dict(left_hand=0, right_hand=1)
-    ]
+    train_sets = []
+    valid_sets = []
 
-    train_sets, valid_sets = [], []
-
-    for dataset, label_map in zip(datasets, label_maps):
+    for ds_cls in dataset_classes:
+        dataset = ds_cls()
+        name = dataset.__class__.__name__
+        map_labels = label_maps.get(name, {})
         all_subjects = dataset.subject_list
-        left_out = all_subjects[0]  # LOSO
+        left_out = all_subjects[0]
 
         train_sets.append(
-            TorchMOABBDataset(dataset, paradigm, subjects=[s for s in all_subjects if s != left_out],
-                              map_labels=label_map, cache_config=CACHE_CONFIG, pad_time=PAD_TIME)
+            TorchMOABBDataset(
+                dataset,
+                paradigm,
+                subjects=[s for s in all_subjects if s != left_out],
+                map_labels=map_labels,
+                cache_config=cache_config,
+                pad_time=pad_time,
+            )
         )
         valid_sets.append(
-            TorchMOABBDataset(dataset, paradigm, subjects=[left_out],
-                              map_labels=label_map, cache_config=CACHE_CONFIG, pad_time=PAD_TIME)
+            TorchMOABBDataset(
+                dataset,
+                paradigm,
+                subjects=[left_out],
+                map_labels=map_labels,
+                cache_config=cache_config,
+                pad_time=pad_time,
+            )
         )
-        logger.info(f"{dataset.__class__.__name__}: Left out subject {left_out} for validation.")
+        logger.info(f"{name}: left out subject {left_out}")
 
     return ConcatDataset(train_sets), ConcatDataset(valid_sets)
 
-# =============== Model ===============
-def get_model() -> SpatialEEGNet:
-    return SpatialEEGNet(
-        T=PAD_TIME,
-        C=22,
-        cnn_temporal_kernels=40,
-        cnn_temporal_kernelsize=[30, 1],
-        cnn_spatial_depth_multiplier=2,
-        cnn_spatial_max_norm=1,
-        cnn_spatial_pool=[4, 1],
-        cnn_septemporal_depth_multiplier=1,
-        cnn_septemporal_point_kernels=64,
-        cnn_septemporal_kernelsize=[15, 1],
-        cnn_septemporal_pool=[2, 1],
-        cnn_pool_type="avg",
-        activation_type="elu",
-        spatial_focus=SpatialFocus(projection_dim=22, position_dim=3, tau=0.5),
-        dense_max_norm=0.25,
-        dropout=0.3,
-        dense_n_neurons=N_CLASSES,
-    ).to(DEVICE)
 
-# =============== Class Weights ===============
-def compute_class_weights(dataset: Dataset, n_classes: int) -> torch.Tensor:
+# =====================
+# Class Weights
+# =====================
+def compute_class_weights(dataset, n_classes, device):
     labels = [dataset[i].y.item() for i in range(len(dataset))]
     counts = pd.Series(labels).value_counts().reindex(range(n_classes), fill_value=0)
     weights = counts.max() / counts
-    return torch.tensor(weights.values, dtype=torch.float32).to(DEVICE)
+    return torch.tensor(weights.values, dtype=torch.float32).to(device)
 
-# =============== Training ===============
-def train(train_loader, model, optimizer, class_weights):
+
+# =====================
+# Training + Evaluation
+# =====================
+def train(model, optimizer, loss_fn, train_loader, device, num_epochs):
     model.train()
-    for epoch in range(1, NUM_EPOCHS + 1):
-        total_loss = 0.0
+    for epoch in range(1, num_epochs + 1):
+        total_loss = 0
         for batch in train_loader:
-            output = model(batch)
-            loss = nll_loss(output, batch.y, weight=class_weights)
+            batch = batch.to(device)
+            out = model(batch)
+            loss = loss_fn(out, batch.y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        logger.info(f"Epoch {epoch}: Loss = {total_loss / len(train_loader):.4f}")
+        logger.info(f"[Epoch {epoch}] Loss: {total_loss / len(train_loader):.4f}")
 
-# =============== Evaluation ===============
-def evaluate(model, valid_loader):
+
+def evaluate(model, valid_loader, device):
     model.eval()
     y_true, y_pred = [], []
     with torch.no_grad():
         for batch in valid_loader:
-            output = model(batch)
-            pred = torch.argmax(output, dim=1)
+            batch = batch.to(device)
+            out = model(batch)
+            pred = torch.argmax(out, dim=1)
             y_true.extend(batch.y.cpu().numpy())
             y_pred.extend(pred.cpu().numpy())
 
-    from sklearn.metrics import balanced_accuracy_score, classification_report
     acc = balanced_accuracy_score(y_true, y_pred)
     report = classification_report(y_true, y_pred, digits=4)
-    logger.info(f"Balanced Accuracy: {acc:.4f}")
-    logger.info(f"Classification Report:\n{report}")
+    logger.info(f"\nBalanced Accuracy: {acc:.4f}\n{report}")
 
-# =============== Main ===============
+
+# =====================
+# Main Execution
+# =====================
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-if __name__ == "__main__":
-    set_seed(SEED)
 
-    logger.info("Preparing LOSO datasets...")
-    train_dataset, valid_dataset = prepare_datasets_with_loso()
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE)
+def main(hyperyaml_path="hyperparams.yaml"):
+    with open(hyperyaml_path) as f:
+        hparams = load_hyperpyyaml(f)
 
-    logger.info("Building model...")
-    model = get_model()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    class_weights = compute_class_weights(train_dataset, N_CLASSES)
+    set_seed(hparams["seed"])
+    device = hparams.get("device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    logger.info("Starting training...")
-    train(train_loader, model, optimizer, class_weights)
+    train_dataset, valid_dataset = prepare_datasets_loso(hparams)
+    train_loader = DataLoader(train_dataset, batch_size=hparams["batch_size"], shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=hparams["batch_size"])
+
+    model = hparams["model"].to(device)
+    optimizer = hparams["optimizer"]
+    loss_fn = hparams["loss"]
+    class_weights = compute_class_weights(train_dataset, hparams["n_classes"], device)
+
+    def weighted_loss(output, target):
+        return loss_fn(output, target, weight=class_weights)
+
+    logger.info("Training model...")
+    train(model, optimizer, weighted_loss, train_loader, device, hparams["number_of_epochs"])
 
     logger.info("Evaluating model...")
-    evaluate(model, valid_loader)
+    evaluate(model, valid_loader, device)
+
+
+if __name__ == "__main__":
+    main()
