@@ -246,7 +246,7 @@ def prepare_dataset_iterators(hparams):
         fmax=hparams["fmax"],
         resample=hparams["sample_rate"],
     )
-    pad_time = hparams["T"]
+    pad_time = 640
 
     merged = []
     subject_offset = 0
