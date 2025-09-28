@@ -11,6 +11,7 @@ cache_config:
   save_epochs: true
   use: true
 data_iterator_name: leave-one-subject-out
+target_subject_idx: !PLACEHOLDER
 target_dataset_idx: !PLACEHOLDER
 sample_rate: 128 # Target sampling rate (Hz)
 # band-pass filtering cut-off frequencies
