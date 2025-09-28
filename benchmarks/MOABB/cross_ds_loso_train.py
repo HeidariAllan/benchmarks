@@ -250,7 +250,23 @@ def prepare_dataset_iterators(hparams):
 
     merged = []
     subject_offset = 0
-    for ds in [BNCI2014_001(), Cho2017(), Lee2019_MI()]:
+
+    # Dataset root provided by sbatch (from $SLURM_TMPDIR/eeg_data)
+    dataset_root = hparams["data_folder"]
+
+    # BNCI2014-001
+    bnci = BNCI2014_001()
+    bnci.dataset_path = os.path.join(dataset_root, "BNCI2014-001")
+
+    # Cho2017
+    cho = Cho2017()
+    cho.dataset_path = os.path.join(dataset_root, "Cho2017")
+
+    # Lee2019_MI
+    lee = Lee2019_MI()
+    lee.dataset_path = os.path.join(dataset_root, "Lee2019_MI")
+
+    for ds in [bnci, cho, lee]:
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
