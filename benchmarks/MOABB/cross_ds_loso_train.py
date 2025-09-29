@@ -264,28 +264,11 @@ def prepare_dataset_iterators(hparams):
     print(f"Using dataset root: {dataset_root}")
     print(f"MNE_DATA is set to: {os.environ.get('MNE_DATA', 'NOT SET')}")
 
-    # Verify datasets exist
-    for ds_name in ["BNCI2014-001", "Cho2017", "Lee2019_MI"]:
-        ds_path = os.path.join(dataset_root, ds_name)
-        if not os.path.exists(ds_path):
-            print(f"WARNING: Dataset path does not exist: {ds_path}")
-            print(f"Available directories in {dataset_root}:")
-            if os.path.exists(dataset_root):
-                print(os.listdir(dataset_root))
-        else:
-            print(f"Found dataset: {ds_path}")
-
-    # BNCI2014-001
     bnci = BNCI2014_001()
-    bnci.dataset_path = os.path.join(dataset_root, "BNCI2014-001")
 
-    # Cho2017
     cho = Cho2017()
-    cho.dataset_path = os.path.join(dataset_root, "Cho2017")
 
-    # Lee2019_MI
     lee = Lee2019_MI()
-    lee.dataset_path = os.path.join(dataset_root, "Lee2019_MI")
 
     for ds in [bnci, cho, lee]:
         print(f"Loading {ds.__class__.__name__} from {ds.dataset_path}")
