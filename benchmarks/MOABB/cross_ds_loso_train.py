@@ -271,7 +271,7 @@ def prepare_dataset_iterators(hparams):
     lee = Lee2019_MI()
 
     for ds in [bnci, cho, lee]:
-        print(f"Loading {ds.__class__.__name__} from {ds.dataset_path}")
+       # print(f"Loading {ds.__class__.__name__} from {ds.dataset_path}")
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
