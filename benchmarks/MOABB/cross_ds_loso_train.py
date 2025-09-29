@@ -18,6 +18,13 @@ import os
 import pickle
 import sys
 
+# CRITICAL: Set environment variables BEFORE importing moabb
+# This must be done before any MOABB imports
+if 'MOABB_DATASET_PATH' in os.environ:
+    os.environ['MNE_DATA'] = os.environ['MOABB_DATASET_PATH']
+elif 'SLURM_TMPDIR' in os.environ:
+    os.environ['MNE_DATA'] = os.path.join(os.environ['SLURM_TMPDIR'], 'eeg_data')
+
 import numpy as np
 import speechbrain as sb
 import torch
@@ -251,8 +258,22 @@ def prepare_dataset_iterators(hparams):
     merged = []
     subject_offset = 0
 
-    # Dataset root provided by sbatch (from $SLURM_TMPDIR/eeg_data)
+    # Dataset root provided by sbatch (from $SLURM_TMPDIR/eeg_data or --data_folder)
     dataset_root = hparams["data_folder"]
+    
+    print(f"Using dataset root: {dataset_root}")
+    print(f"MNE_DATA is set to: {os.environ.get('MNE_DATA', 'NOT SET')}")
+
+    # Verify datasets exist
+    for ds_name in ["BNCI2014-001", "Cho2017", "Lee2019_MI"]:
+        ds_path = os.path.join(dataset_root, ds_name)
+        if not os.path.exists(ds_path):
+            print(f"WARNING: Dataset path does not exist: {ds_path}")
+            print(f"Available directories in {dataset_root}:")
+            if os.path.exists(dataset_root):
+                print(os.listdir(dataset_root))
+        else:
+            print(f"Found dataset: {ds_path}")
 
     # BNCI2014-001
     bnci = BNCI2014_001()
@@ -267,6 +288,7 @@ def prepare_dataset_iterators(hparams):
     lee.dataset_path = os.path.join(dataset_root, "Lee2019_MI")
 
     for ds in [bnci, cho, lee]:
+        print(f"Loading {ds.__class__.__name__} from {ds.dataset_path}")
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
