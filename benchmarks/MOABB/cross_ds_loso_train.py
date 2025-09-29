@@ -17,17 +17,6 @@ import logging
 import os
 import pickle
 import sys
-
-# CRITICAL: Set environment variables BEFORE importing moabb
-# This must be done before any MOABB imports
-if 'MOABB_DATASET_PATH' in os.environ:
-    os.environ['MNE_DATA'] = os.environ['MOABB_DATASET_PATH']
-elif 'SLURM_TMPDIR' in os.environ:
-    os.environ['MNE_DATA'] = os.path.join(os.environ['SLURM_TMPDIR'], 'eeg_data')
-
-import mne
-mne.set_config('MNE_DATA', os.environ.get('MNE_DATA', os.path.join(os.environ.get('SLURM_TMPDIR', '/tmp'), 'eeg_data')), set_env=True)
-
 import numpy as np
 import speechbrain as sb
 import torch
