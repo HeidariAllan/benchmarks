@@ -1,38 +1,93 @@
 #!/usr/bin/python
 """
-Cross-dataset training with leave-one-subject-out (LOSO).
-Merges BNCI2014_001, Cho2017, and Lee2019_MI into one unified dataset with
-unique subject IDs and runs the standard SpeechBrain training pipeline.
-
-Usage:
-    python cross_ds_train.py hparams/MotorImagery/EEGNet.yaml \
-        --data_folder=eeg_data \
-        --cached_data_folder=eeg_pickled_data \
-        --output_folder=results/MotorImagery/EEGNet \
-        --data_iterator_name=leave-one-subject-out \
-        --target_subject_idx=0
+Cross-dataset training with leave-one-subject-out (LOSO) and SWA support.
+Uses standalone training loop instead of SpeechBrain Brain class.
 """
 
-import logging
 import os
-import pickle
 import sys
+
+# CRITICAL: Set MNE_DATA before importing MOABB to use local datasets
+os.environ['MNE_DATA'] = os.environ.get('SLURM_TMPDIR', '/tmp') + '/mne_data'
+
+import logging
+import pickle
 import numpy as np
-import speechbrain as sb
 import torch
 import yaml
+import speechbrain as sb
 from hyperpyyaml import load_hyperpyyaml
-from torch.nn import init
 from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataLoader
 from torch.utils.data import ConcatDataset, Dataset
 from functools import cached_property
 import warnings
 from contextlib import redirect_stdout
 import pandas as pd
+from torch.optim.swa_utils import AveragedModel, SWALR
+from sklearn import metrics
 
 from moabb.datasets import BNCI2014_001, Cho2017, Lee2019_MI
 from moabb.paradigms import MotorImagery
+
+# CRITICAL: Patch MOABB download function to use local files only
+import moabb.datasets.download as moabb_dl
+from urllib.parse import urlparse
+
+def local_first_data_dl(url, sign, path=None, force_update=False, verbose=None):
+    """Check if file exists locally before attempting download"""
+    parsed = urlparse(url)
+    filename = os.path.basename(parsed.path)
+    
+    if path is None:
+        path = os.environ.get('MNE_DATA', os.path.expanduser('~/mne_data'))
+    
+    # Construct local path based on dataset type
+    if 'bnci' in url.lower():
+        local_path = os.path.join(path, 'MNE-bnci-data', parsed.path.lstrip('/'))
+    elif 'gigadb' in url.lower():
+        local_path = os.path.join(path, 'MNE-gigadb-data', parsed.path.lstrip('/'))
+    else:
+        local_path = os.path.join(path, 'MNE-lee2019-mi-data', parsed.path.lstrip('/'))
+    
+    if os.path.exists(local_path) and not force_update:
+        return local_path
+    else:
+        raise FileNotFoundError(f"File not found locally and downloads disabled: {local_path}")
+
+# Apply the patch
+moabb_dl.data_dl = local_first_data_dl
+
 from utils.graph_iterators import LeaveOneSubjectOut
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# Device setup - always GPU
+DEVICE = torch.device("cuda")
+
+
+# ------------------------------
+# Seed setting for reproducibility
+# ------------------------------
+def set_seed(seed):
+    """
+    Set random seed for reproducibility across all libraries.
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    logger.info(f"Random seed set to: {seed}")
 
 
 # ------------------------------
@@ -125,120 +180,250 @@ class TorchMOABBDataset(Dataset):
 
 
 # ------------------------------
-# SpeechBrain Brain class
+# Data loader preparation
 # ------------------------------
-class MOABBBrain(sb.Brain):
-    def init_model(self, model):
-        for mod in model.modules():
-            if hasattr(mod, "weight"):
-                if "Norm" not in mod.__class__.__name__:
-                    init.xavier_uniform_(mod.weight, gain=1)
-                else:
-                    init.constant_(mod.weight, 1)
-            if hasattr(mod, "bias") and mod.bias is not None:
-                init.constant_(mod.bias, 0)
-
-    def compute_forward(self, batch, stage):
-        inputs = batch.to(self.device)
-
-        if (
-            stage == sb.Stage.TRAIN
-            and hasattr(self.hparams, "augment")
-            and self.hparams.repeat_augment > 0
-        ):
-            aug, _ = self.hparams.augment(
-                inputs.x.unsqueeze(-1),
-                lengths=torch.ones(inputs.x.shape[0], device=self.device),
-            )
-            if self.hparams.augment.concat_original:
-                inputs = inputs.concat(inputs)
-            inputs.x = aug.squeeze(-1)
-
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "graph_augment"):
-            inputs = self.hparams.graph_augment(inputs)
-
-        if hasattr(self.hparams, "normalize"):
-            inputs.x = self.hparams.normalize(inputs.x)
-        return self.modules.model(inputs)
-
-    def compute_objectives(self, predictions, batch, stage):
-        targets = batch.y.to(self.device)
-        N_augments = int(predictions.shape[0] / targets.shape[0])
-        targets = torch.cat(N_augments * [targets], dim=0)
-
-        loss = self.hparams.loss(
-            predictions,
-            targets,
-            weight=torch.FloatTensor(self.hparams.class_weights).to(self.device),
-        )
-        if stage != sb.Stage.TRAIN:
-            tmp_preds = torch.exp(predictions)
-            self.preds.extend(tmp_preds.detach().cpu().numpy())
-            self.targets.extend(batch.y.cpu().numpy())
-        else:
-            if hasattr(self.hparams, "lr_annealing"):
-                self.hparams.lr_annealing.on_batch_end(self.optimizer)
-        return loss
-
-    def on_stage_start(self, stage, epoch=None):
-        if stage != sb.Stage.TRAIN:
-            self.preds, self.targets = [], []
-
-    def on_stage_end(self, stage, stage_loss, epoch=None):
-        if stage == sb.Stage.TRAIN:
-            self.train_loss = stage_loss
-        else:
-            preds = np.array(self.preds)
-            y_pred = np.argmax(preds, axis=-1)
-            y_true = self.targets
-            self.last_eval_stats = {"loss": stage_loss}
-            for metric_key in self.hparams.metrics.keys():
-                self.last_eval_stats[metric_key] = self.hparams.metrics[metric_key](
-                    y_true=y_true, y_pred=y_pred
-                )
+def prepare_dataloaders(datasets, batch_size):
+    """
+    Create train and test data loaders.
+    No validation set - pure LOSO paradigm.
+    """
+    train_loader = DataLoader(
+        datasets["train"],
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    test_loader = DataLoader(
+        datasets["test"],
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    
+    logger.info(f"Train batches: {len(train_loader)}")
+    logger.info(f"Test batches: {len(test_loader)}")
+    
+    return train_loader, test_loader
 
 
-# ------------------------------
-# Training pipeline
-# ------------------------------
-def run_experiment(hparams, run_opts, datasets):
-    ys = Batch.from_data_list(datasets["train"].dataset).y
+def compute_class_weights(train_dataset, n_classes):
+    """
+    Compute class weights for balanced loss.
+    """
+    ys = Batch.from_data_list(train_dataset.dataset).y
     idx_examples = np.arange(ys.shape[0])
     n_examples_perclass = [
         idx_examples[np.where(ys == c)[0]].shape[0]
-        for c in range(hparams["n_classes"])
+        for c in range(n_classes)
     ]
-    class_weights = np.array(n_examples_perclass).max() / np.array(
-        n_examples_perclass
-    )
-    hparams["class_weights"] = class_weights
-
-    checkpointer = sb.utils.checkpoints.Checkpointer(
-        checkpoints_dir=os.path.join(hparams["exp_dir"], "save"),
-        recoverables={"model": hparams["model"], "counter": hparams["epoch_counter"]},
-    )
-    hparams["train_logger"] = sb.utils.train_logger.FileTrainLogger(
-        save_file=os.path.join(hparams["exp_dir"], "train_log.txt")
-    )
-
-    brain = MOABBBrain(
-        modules={"model": hparams["model"]},
-        opt_class=hparams["optimizer"],
-        hparams=hparams,
-        run_opts=run_opts,
-        checkpointer=checkpointer,
-    )
-    brain.fit(
-        epoch_counter=hparams["epoch_counter"],
-        train_set=datasets["train"],
-        valid_set=datasets["valid"],
-        progressbar=False,
-    )
-    brain.evaluate(datasets["test"], progressbar=False)
+    class_weights = np.array(n_examples_perclass).max() / np.array(n_examples_perclass)
+    class_weights = torch.FloatTensor(class_weights).to(DEVICE)
+    logger.info(f"Class weights: {class_weights.cpu().numpy()}")
+    return class_weights
 
 
-def prepare_dataset_iterators(hparams):
-    print("Preparing merged dataset (BNCI+Cho+Lee)...")
+# ------------------------------
+# Training function with SWA
+# ------------------------------
+def run_model(hparams, run_opts, datasets):
+    """
+    Standalone training loop with SWA support for LOSO.
+    SWA is always enabled.
+    """
+    # Set random seed for reproducibility
+    seed = hparams.get("seed", 1234)
+    set_seed(seed)
+    
+    logger.info(f"Using device: {DEVICE}")
+    
+    # Prepare data loaders
+    train_loader, test_loader = prepare_dataloaders(
+        datasets, hparams["batch_size"]
+    )
+    
+    # Compute class weights
+    class_weights = compute_class_weights(
+        datasets["train"], hparams["n_classes"]
+    )
+    
+    # Initialize model
+    model = hparams["model"].to(DEVICE)
+    logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
+    
+    # Setup optimizer and scheduler
+    optimizer = hparams["optimizer"](model.parameters())
+    
+    # Regular scheduler (before SWA)
+    if hasattr(hparams, "lr_annealing"):
+        scheduler = hparams["lr_annealing"]
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=hparams["number_of_epochs"]
+        )
+    
+    # SWA setup (always enabled)
+    swa_start_ratio = hparams.get("swa_start_ratio", 0.75)
+    swa_start = 1 + int(swa_start_ratio * hparams["number_of_epochs"])
+    swa_lr = hparams.get("swa_lr", 0.05)
+    
+    swa_model = AveragedModel(model)
+    swa_scheduler = SWALR(
+        optimizer,
+        anneal_strategy="linear",
+        anneal_epochs=swa_start,
+        swa_lr=swa_lr,
+    )
+    logger.info(f"SWA will start at epoch {swa_start}/{hparams['number_of_epochs']}")
+    logger.info(f"SWA learning rate: {swa_lr}")
+    
+    # Loss function
+    loss_fn = hparams["loss"]
+    
+    # Training loop
+    gradient_accumulation = 4  # Can make this a hparam if needed
+    logger.info("Starting training...")
+    
+    for epoch in range(1, hparams["number_of_epochs"] + 1):
+        model.train()
+        running_loss = 0.0
+        num_batches = 0
+        
+        optimizer.zero_grad()
+        for idx, batch in enumerate(train_loader):
+            # Move batch to device
+            batch = batch.to(DEVICE)
+            
+            # Apply augmentation if configured
+            if hasattr(hparams, "augment") and hparams.get("repeat_augment", 0) > 0:
+                aug, _ = hparams.augment(
+                    batch.x.unsqueeze(-1),
+                    lengths=torch.ones(batch.x.shape[0], device=DEVICE),
+                )
+                if hparams.augment.concat_original:
+                    batch = Batch.from_data_list([batch, batch])
+                batch.x = aug.squeeze(-1)
+            
+            # Apply graph augmentation if configured
+            if hasattr(hparams, "graph_augment"):
+                batch = hparams.graph_augment(batch)
+            
+            # Apply normalization if configured
+            if hasattr(hparams, "normalize"):
+                batch.x = hparams.normalize(batch.x)
+            
+            # Forward pass
+            output = model(batch)
+            loss = loss_fn(output, batch.y, weight=class_weights)
+            
+            # Backward pass with gradient accumulation
+            (loss / gradient_accumulation).backward()
+            
+            running_loss += loss.item()
+            num_batches += 1
+            
+            # Update weights every gradient_accumulation batches
+            if (idx + 1) % gradient_accumulation == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+        
+        # Handle last batch if it didn't trigger update
+        if (idx + 1) % gradient_accumulation != 0:
+            optimizer.step()
+            optimizer.zero_grad()
+        
+        # Calculate average loss
+        avg_loss = running_loss / num_batches
+        logger.info(f"Epoch {epoch}/{hparams['number_of_epochs']} - Training Loss: {avg_loss:.4f}")
+        
+        # Update schedulers and SWA model
+        if epoch >= swa_start:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+            logger.info(f"Epoch {epoch}: Updated SWA model parameters")
+        else:
+            if hasattr(scheduler, "step"):
+                scheduler.step()
+    
+    # Update SWA batch norm statistics
+    logger.info("Updating SWA batch normalization statistics...")
+    swa_model.eval()
+    with torch.no_grad():
+        for batch in train_loader:
+            batch = batch.to(DEVICE)
+            swa_model(batch)
+    
+    logger.info("Using SWA model for evaluation")
+    
+    # Evaluate on test set (left-out subject)
+    logger.info("Evaluating on test set (left-out subject)...")
+    swa_model.eval()
+    y_true_all = []
+    y_pred_all = []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(DEVICE)
+            output = swa_model(batch)
+            y_pred = torch.argmax(output, dim=-1).cpu().numpy()
+            y_true = batch.y.cpu().numpy()
+            
+            y_true_all.extend(y_true)
+            y_pred_all.extend(y_pred)
+    
+    # Compute metrics
+    y_true_all = np.array(y_true_all)
+    y_pred_all = np.array(y_pred_all)
+    
+    test_metrics = {}
+    for metric_name, metric_func in hparams["metrics"].items():
+        if metric_name == "cm":
+            test_metrics[metric_name] = metric_func(y_true_all, y_pred_all).tolist()
+        else:
+            test_metrics[metric_name] = metric_func(y_true=y_true_all, y_pred=y_pred_all)
+    
+    logger.info(f"Test metrics: {test_metrics}")
+    
+    # Get dataset name for this subject
+    target_subject = hparams["target_subject_idx"]
+    dataset_name = hparams["subject_to_dataset"].get(target_subject, "Unknown")
+    logger.info(f"Left-out subject {target_subject} is from dataset: {dataset_name}")
+    
+    # Add dataset info to metrics
+    test_metrics["subject_id"] = target_subject
+    test_metrics["dataset_name"] = dataset_name
+    
+    # Save results
+    save_dir = os.path.join(hparams["exp_dir"], "save")
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save original model
+    model_path = os.path.join(save_dir, "model.ckpt")
+    torch.save(model.state_dict(), model_path)
+    logger.info(f"Saved model to {model_path}")
+    
+    # Save SWA model
+    swa_model_path = os.path.join(save_dir, "swa_model.ckpt")
+    torch.save(
+        swa_model.module.state_dict() if hasattr(swa_model, "module") else swa_model.state_dict(),
+        swa_model_path
+    )
+    logger.info(f"Saved SWA model to {swa_model_path}")
+    
+    # Save metrics
+    test_metrics_path = os.path.join(save_dir, "test_metrics.pkl")
+    with open(test_metrics_path, "wb") as f:
+        pickle.dump(test_metrics, f)
+    
+    logger.info("Training completed successfully!")
+    return test_metrics
+
+
+# ------------------------------
+# Dataset preparation
+# ------------------------------
+def prepare_merged_dataset(hparams):
+    """
+    Prepare and merge BNCI, Cho, and Lee datasets.
+    """
+    logger.info("Preparing merged dataset (BNCI+Cho+Lee)...")
 
     paradigm = MotorImagery(
         fmin=hparams["fmin"],
@@ -249,44 +434,66 @@ def prepare_dataset_iterators(hparams):
 
     merged = []
     subject_offset = 0
+    subject_to_dataset = {}  # Map subject ID to dataset name
 
-    # Dataset root provided by sbatch (from $SLURM_TMPDIR/eeg_data or --data_folder)
     dataset_root = hparams["data_folder"]
-    
-    print(f"Using dataset root: {dataset_root}")
-    print(f"MNE_DATA is set to: {os.environ.get('MNE_DATA', 'NOT SET')}")
+    logger.info(f"Using dataset root: {dataset_root}")
 
     bnci = BNCI2014_001()
-
     cho = Cho2017()
-
     lee = Lee2019_MI()
 
-    for ds in [bnci, cho, lee]:
-       # print(f"Loading {ds.__class__.__name__} from {ds.dataset_path}")
+    dataset_info = [
+        (bnci, "BNCI2014_001"),
+        (cho, "Cho2017"),
+        (lee, "Lee2019_MI")
+    ]
+
+    for ds, dataset_name in dataset_info:
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
             cache_config=hparams.get("cache_config"),
             pad_time=pad_time,
         )
+        
+        # Track which subjects belong to which dataset
+        subject_start = subject_offset
         torch_ds._data[2]["subject"] += subject_offset
         subject_offset = torch_ds._data[2]["subject"].max() + 1
+        subject_end = subject_offset
+        
+        # Map each subject to its dataset
+        for subj_id in range(subject_start, subject_end):
+            subject_to_dataset[subj_id] = dataset_name
+        
+        logger.info(f"{dataset_name}: subjects {subject_start} to {subject_end-1}")
         merged.append(torch_ds)
 
     total_subjects = subject_offset
     hparams["n_subjects"] = total_subjects
-    print(f"Total merged subjects: {total_subjects}")
+    hparams["subject_to_dataset"] = subject_to_dataset  # Store mapping
+    logger.info(f"Total merged subjects: {total_subjects}")
+    
+    return ConcatDataset(merged)
 
+
+def prepare_dataset_iterators(hparams):
+    """
+    Prepare LOSO dataset splits.
+    Pure LOSO: train on N-1 subjects, test on 1 subject.
+    """
+    merged_dataset = prepare_merged_dataset(hparams)
+    
     data_iterator = LeaveOneSubjectOut(
-        datasets=[ConcatDataset(merged)],
+        datasets=[merged_dataset],
         resample=hparams["sample_rate"],
         fmin=hparams["fmin"],
         fmax=hparams["fmax"],
         tmin=hparams["tmin"],
         tmax=hparams["tmax"],
-        events=hparams["events_to_load"],
-        valid_ratio=hparams["valid_ratio"],
+        events=hparams.get("events_to_load"),
+        valid_ratio=0.0,  # No validation split - pure LOSO
         target_subjects=hparams["target_subject_idx"] + 1,
         target_sessions=hparams["target_session_idx"],
     )
@@ -296,6 +503,10 @@ def prepare_dataset_iterators(hparams):
         cached_data_folder=hparams["cached_data_folder"],
         batch_size=hparams["batch_size"],
     )
+    
+    logger.info(f"Train set size: {len(datasets['train'].dataset)}")
+    logger.info(f"Test set size: {len(datasets['test'].dataset)}")
+    
     tail_path = os.path.join(
         "cross-ds-loso", f"sub-{str(hparams['target_subject_idx']+1).zfill(3)}"
     )
@@ -303,11 +514,16 @@ def prepare_dataset_iterators(hparams):
 
 
 def load_hparams_and_dataset_iterators(hparams_file, run_opts, overrides):
+    """
+    Load hyperparameters and prepare datasets.
+    """
     with open(hparams_file) as fin:
         hparams = load_hyperpyyaml(fin, overrides)
+    
     tail_path, datasets = prepare_dataset_iterators(hparams)
     overrides.update(n_train_examples=len(datasets["train"].dataset))
     hparams["exp_dir"] = os.path.join(hparams["output_folder"], tail_path)
+    
     sb.create_experiment_directory(
         experiment_directory=hparams["exp_dir"],
         hyperparams_to_save=hparams_file,
@@ -323,4 +539,4 @@ if __name__ == "__main__":
     hparams, datasets = load_hparams_and_dataset_iterators(
         hparams_file, run_opts, overrides
     )
-    run_experiment(hparams, run_opts, datasets)
+    run_model(hparams, run_opts, datasets)
