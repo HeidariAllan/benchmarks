@@ -450,25 +450,36 @@ def prepare_merged_dataset(hparams):
     ]
 
     for ds, dataset_name in dataset_info:
+      if dataset_name == "BNCI2014_001":
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
+            map_labels=dict(left_hand=0, right_hand=1, feet=2, tongue=2),
+            cache_config=hparams.get("cache_config"),
+            pad_time=pad_time,
+        )
+
+      else:
+        torch_ds = TorchMOABBDataset(
+            dataset=ds,
+            paradigm=paradigm,
+            map_labels=dict(left_hand=0, right_hand=1),
             cache_config=hparams.get("cache_config"),
             pad_time=pad_time,
         )
         
-        # Track which subjects belong to which dataset
-        subject_start = subject_offset
-        torch_ds._data[2]["subject"] += subject_offset
-        subject_offset = torch_ds._data[2]["subject"].max() + 1
-        subject_end = subject_offset
+      # Track which subjects belong to which dataset
+      subject_start = subject_offset
+      torch_ds._data[2]["subject"] += subject_offset
+      subject_offset = int(torch_ds._data[2]["subject"].max()) + 1
+      subject_end = subject_offset
         
-        # Map each subject to its dataset
-        for subj_id in range(subject_start, subject_end):
-            subject_to_dataset[subj_id] = dataset_name
+      # Map each subject to its dataset
+      for subj_id in range(subject_start, subject_end):
+        subject_to_dataset[subj_id] = dataset_name
         
-        logger.info(f"{dataset_name}: subjects {subject_start} to {subject_end-1}")
-        merged.append(torch_ds)
+      logger.info(f"{dataset_name}: subjects {subject_start} to {subject_end-1}")
+      merged.append(torch_ds)
 
     total_subjects = subject_offset
     hparams["n_subjects"] = total_subjects
