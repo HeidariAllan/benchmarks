@@ -302,9 +302,6 @@ def run_model(hparams, run_opts, datasets):
     gradient_accumulation = hparams.get("gradient_accumulation", 4)
     logger.info(f"Starting training with gradient accumulation steps: {gradient_accumulation}")
 
-    # Use mixed precision training for speed
-    scaler = torch.cuda.amp.GradScaler()
-
     for epoch in range(1, hparams["number_of_epochs"] + 1):
         model.train()
         running_loss = 0.0
@@ -312,33 +309,23 @@ def run_model(hparams, run_opts, datasets):
 
         optimizer.zero_grad()
         for idx, batch in enumerate(train_loader):
-            # Move batch to device (non-blocking for async transfer)
-            batch = batch.to(DEVICE, non_blocking=True)
+            # Move batch to device
+            batch = batch.to(DEVICE)
 
-            # Use automatic mixed precision for faster training
-            with torch.cuda.amp.autocast():
-                # Forward pass
-                output = model(batch)
-                loss = loss_fn(output, batch.y, weight=class_weights)
-                loss = loss / gradient_accumulation
+            # Forward pass
+            output = model(batch)
+            loss = loss_fn(output, batch.y, weight=class_weights)
 
-            # Backward pass with gradient accumulation and mixed precision
-            scaler.scale(loss).backward()
+            # Backward pass
+            loss.backward()
 
-            running_loss += loss.item() * gradient_accumulation
+            running_loss += loss.item()
             num_batches += 1
 
             # Update weights every gradient_accumulation batches
-            if (idx + 1) % gradient_accumulation == 0:
-                scaler.step(optimizer)
-                scaler.update()
+            if idx % gradient_accumulation == gradient_accumulation - 1:
+                optimizer.step()
                 optimizer.zero_grad()
-
-        # Handle last batch if it didn't trigger update
-        if (idx + 1) % gradient_accumulation != 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
 
         # Calculate average loss
         avg_loss = running_loss / num_batches
@@ -366,9 +353,9 @@ def run_model(hparams, run_opts, datasets):
     y_true_all = []
     y_pred_all = []
 
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad():
         for batch in test_loader:
-            batch = batch.to(DEVICE, non_blocking=True)
+            batch = batch.to(DEVICE)
             output = swa_model(batch)
             y_pred = torch.argmax(output, dim=-1).cpu().numpy()
             y_true = batch.y.cpu().numpy()
