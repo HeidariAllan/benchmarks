@@ -271,9 +271,6 @@ def run_model(hparams, run_opts, datasets):
     model = hparams["model"].to(DEVICE)
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
 
-    # Enable cuDNN autotuner for better performance
-    torch.backends.cudnn.benchmark = True
-
     # Setup optimizer and scheduler
     optimizer = hparams["optimizer"](model.parameters())
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
