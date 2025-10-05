@@ -206,7 +206,7 @@ run_experiment() {
   local target_session_idx="$1"
   local output_folder_exp="$2"
 
-  for target_subject_idx in $(seq 0 1 $(( nsbj - 1 ))); do
+  for target_subject_idx in $(seq 1 1 $nsbj); do
     echo "Subject $target_subject_idx"
     python cross_ds_loso_train.py $hparams --seed=$seed --data_folder=$data_folder --cached_data_folder=$cached_data_folder --output_folder=$output_folder_exp\
       --target_subject_idx=$target_subject_idx --target_session_idx=$target_session_idx \
