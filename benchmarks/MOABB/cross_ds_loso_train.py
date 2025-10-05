@@ -19,7 +19,7 @@ import speechbrain as sb
 from hyperpyyaml import load_hyperpyyaml
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
-from torch.utils.data import ConcatDataset, Dataset
+from torch.utils.data import ConcatDataset, Dataset, Subset
 from functools import cached_property
 import warnings
 from contextlib import redirect_stdout
@@ -38,18 +38,20 @@ def local_first_data_dl(url, sign, path=None, force_update=False, verbose=None):
     """Check if file exists locally before attempting download"""
     parsed = urlparse(url)
     filename = os.path.basename(parsed.path)
-    
+
     if path is None:
         path = os.environ.get('MNE_DATA', os.path.expanduser('~/mne_data'))
-    
+
     # Construct local path based on dataset type
     if 'bnci' in url.lower():
         local_path = os.path.join(path, 'MNE-bnci-data', parsed.path.lstrip('/'))
-    elif 'gigadb' in url.lower():
+    elif '100542' in url:  # Lee2019_MI specific dataset ID
+        local_path = os.path.join(path, 'MNE-lee2019-mi-data', parsed.path.lstrip('/'))
+    elif 'gigadb' in url.lower():  # Cho2017
         local_path = os.path.join(path, 'MNE-gigadb-data', parsed.path.lstrip('/'))
     else:
         local_path = os.path.join(path, 'MNE-lee2019-mi-data', parsed.path.lstrip('/'))
-    
+
     if os.path.exists(local_path) and not force_update:
         return local_path
     else:
@@ -57,8 +59,6 @@ def local_first_data_dl(url, sign, path=None, force_update=False, verbose=None):
 
 # Apply the patch
 moabb_dl.data_dl = local_first_data_dl
-
-from utils.graph_iterators import LeaveOneSubjectOut
 
 # Setup logging
 logging.basicConfig(
@@ -191,16 +191,21 @@ def prepare_dataloaders(datasets, batch_size):
         datasets["train"],
         batch_size=batch_size,
         shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
     test_loader = DataLoader(
         datasets["test"],
         batch_size=batch_size,
         shuffle=False,
+        num_workers=2,
+        pin_memory=True,
     )
-    
+
     logger.info(f"Train batches: {len(train_loader)}")
     logger.info(f"Test batches: {len(test_loader)}")
-    
+
     return train_loader, test_loader
 
 
@@ -208,14 +213,32 @@ def compute_class_weights(train_dataset, n_classes):
     """
     Compute class weights for balanced loss.
     """
-    ys = Batch.from_data_list(train_dataset.dataset).y
-    idx_examples = np.arange(ys.shape[0])
-    n_examples_perclass = [
-        idx_examples[np.where(ys == c)[0]].shape[0]
-        for c in range(n_classes)
-    ]
-    class_weights = np.array(n_examples_perclass).max() / np.array(n_examples_perclass)
-    class_weights = torch.FloatTensor(class_weights).to(DEVICE)
+    # Collect labels from the dataset
+    if isinstance(train_dataset, Subset):
+        # Collect labels only from the subset indices
+        train_labels = [
+            train_dataset.dataset[idx].y.item() for idx in train_dataset.indices
+        ]
+    else:
+        # For regular datasets, collect all labels
+        train_labels = [
+            train_dataset[i].y.item() for i in range(len(train_dataset))
+        ]
+    
+    # Compute class counts using pandas
+    class_counts = pd.Series(train_labels).value_counts().sort_index()
+    
+    # Ensure all classes are present
+    if len(class_counts) < n_classes:
+        for cls in range(n_classes):
+            if cls not in class_counts:
+                class_counts.loc[cls] = 0
+    class_counts = class_counts.sort_index()
+    
+    # Compute weights: normalized frequency
+    class_weights = class_counts / class_counts.max()
+    class_weights = torch.from_numpy(class_weights.values).float().to(DEVICE)
+    
     logger.info(f"Class weights: {class_weights.cpu().numpy()}")
     return class_weights
 
@@ -231,39 +254,37 @@ def run_model(hparams, run_opts, datasets):
     # Set random seed for reproducibility
     seed = hparams.get("seed", 1234)
     set_seed(seed)
-    
+
     logger.info(f"Using device: {DEVICE}")
-    
+
     # Prepare data loaders
     train_loader, test_loader = prepare_dataloaders(
         datasets, hparams["batch_size"]
     )
-    
+
     # Compute class weights
     class_weights = compute_class_weights(
         datasets["train"], hparams["n_classes"]
     )
-    
+
     # Initialize model
     model = hparams["model"].to(DEVICE)
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
-    
+
+    # Enable cuDNN autotuner for better performance
+    torch.backends.cudnn.benchmark = True
+
     # Setup optimizer and scheduler
     optimizer = hparams["optimizer"](model.parameters())
-    
-    # Regular scheduler (before SWA)
-    if hasattr(hparams, "lr_annealing"):
-        scheduler = hparams["lr_annealing"]
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=hparams["number_of_epochs"]
-        )
-    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=hparams["number_of_epochs"]
+    )
+
     # SWA setup (always enabled)
     swa_start_ratio = hparams.get("swa_start_ratio", 0.75)
     swa_start = 1 + int(swa_start_ratio * hparams["number_of_epochs"])
     swa_lr = hparams.get("swa_lr", 0.05)
-    
+
     swa_model = AveragedModel(model)
     swa_scheduler = SWALR(
         optimizer,
@@ -273,145 +294,127 @@ def run_model(hparams, run_opts, datasets):
     )
     logger.info(f"SWA will start at epoch {swa_start}/{hparams['number_of_epochs']}")
     logger.info(f"SWA learning rate: {swa_lr}")
-    
+
     # Loss function
     loss_fn = hparams["loss"]
-    
+
     # Training loop
-    gradient_accumulation = 4  # Can make this a hparam if needed
-    logger.info("Starting training...")
-    
+    gradient_accumulation = hparams.get("gradient_accumulation", 4)
+    logger.info(f"Starting training with gradient accumulation steps: {gradient_accumulation}")
+
+    # Use mixed precision training for speed
+    scaler = torch.cuda.amp.GradScaler()
+
     for epoch in range(1, hparams["number_of_epochs"] + 1):
         model.train()
         running_loss = 0.0
         num_batches = 0
-        
+
         optimizer.zero_grad()
         for idx, batch in enumerate(train_loader):
-            # Move batch to device
-            batch = batch.to(DEVICE)
-            
-            # Apply augmentation if configured
-            if hasattr(hparams, "augment") and hparams.get("repeat_augment", 0) > 0:
-                aug, _ = hparams.augment(
-                    batch.x.unsqueeze(-1),
-                    lengths=torch.ones(batch.x.shape[0], device=DEVICE),
-                )
-                if hparams.augment.concat_original:
-                    batch = Batch.from_data_list([batch, batch])
-                batch.x = aug.squeeze(-1)
-            
-            # Apply graph augmentation if configured
-            if hasattr(hparams, "graph_augment"):
-                batch = hparams.graph_augment(batch)
-            
-            # Apply normalization if configured
-            if hasattr(hparams, "normalize"):
-                batch.x = hparams.normalize(batch.x)
-            
-            # Forward pass
-            output = model(batch)
-            loss = loss_fn(output, batch.y, weight=class_weights)
-            
-            # Backward pass with gradient accumulation
-            (loss / gradient_accumulation).backward()
-            
-            running_loss += loss.item()
+            # Move batch to device (non-blocking for async transfer)
+            batch = batch.to(DEVICE, non_blocking=True)
+
+            # Use automatic mixed precision for faster training
+            with torch.cuda.amp.autocast():
+                # Forward pass
+                output = model(batch)
+                loss = loss_fn(output, batch.y, weight=class_weights)
+                loss = loss / gradient_accumulation
+
+            # Backward pass with gradient accumulation and mixed precision
+            scaler.scale(loss).backward()
+
+            running_loss += loss.item() * gradient_accumulation
             num_batches += 1
-            
+
             # Update weights every gradient_accumulation batches
             if (idx + 1) % gradient_accumulation == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
-        
+
         # Handle last batch if it didn't trigger update
         if (idx + 1) % gradient_accumulation != 0:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
-        
+
         # Calculate average loss
         avg_loss = running_loss / num_batches
-        logger.info(f"Epoch {epoch}/{hparams['number_of_epochs']} - Training Loss: {avg_loss:.4f}")
-        
+
         # Update schedulers and SWA model
         if epoch >= swa_start:
             swa_model.update_parameters(model)
             swa_scheduler.step()
-            logger.info(f"Epoch {epoch}: Updated SWA model parameters")
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch}/{hparams['number_of_epochs']} - Loss: {avg_loss:.4f} - SWA active")
         else:
-            if hasattr(scheduler, "step"):
-                scheduler.step()
-    
+            scheduler.step()
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch}/{hparams['number_of_epochs']} - Loss: {avg_loss:.4f}")
+
     # Update SWA batch norm statistics
     logger.info("Updating SWA batch normalization statistics...")
-    swa_model.eval()
-    with torch.no_grad():
-        for batch in train_loader:
-            batch = batch.to(DEVICE)
-            swa_model(batch)
-    
+    torch.optim.swa_utils.update_bn(train_loader, swa_model, device=DEVICE)
+
     logger.info("Using SWA model for evaluation")
-    
+
     # Evaluate on test set (left-out subject)
     logger.info("Evaluating on test set (left-out subject)...")
     swa_model.eval()
     y_true_all = []
     y_pred_all = []
-    
-    with torch.no_grad():
+
+    with torch.no_grad(), torch.cuda.amp.autocast():
         for batch in test_loader:
-            batch = batch.to(DEVICE)
+            batch = batch.to(DEVICE, non_blocking=True)
             output = swa_model(batch)
             y_pred = torch.argmax(output, dim=-1).cpu().numpy()
             y_true = batch.y.cpu().numpy()
-            
+
             y_true_all.extend(y_true)
             y_pred_all.extend(y_pred)
-    
+
     # Compute metrics
     y_true_all = np.array(y_true_all)
     y_pred_all = np.array(y_pred_all)
-    
+
     test_metrics = {}
     for metric_name, metric_func in hparams["metrics"].items():
         if metric_name == "cm":
             test_metrics[metric_name] = metric_func(y_true_all, y_pred_all).tolist()
         else:
             test_metrics[metric_name] = metric_func(y_true=y_true_all, y_pred=y_pred_all)
-    
+
     logger.info(f"Test metrics: {test_metrics}")
-    
+
     # Get dataset name for this subject
     target_subject = hparams["target_subject_idx"]
     dataset_name = hparams["subject_to_dataset"].get(target_subject, "Unknown")
     logger.info(f"Left-out subject {target_subject} is from dataset: {dataset_name}")
-    
+
     # Add dataset info to metrics
     test_metrics["subject_id"] = target_subject
     test_metrics["dataset_name"] = dataset_name
-    
+
     # Save results
     save_dir = os.path.join(hparams["exp_dir"], "save")
     os.makedirs(save_dir, exist_ok=True)
-    
-    # Save original model
-    model_path = os.path.join(save_dir, "model.ckpt")
-    torch.save(model.state_dict(), model_path)
-    logger.info(f"Saved model to {model_path}")
-    
-    # Save SWA model
+
+    # Save SWA model only
     swa_model_path = os.path.join(save_dir, "swa_model.ckpt")
     torch.save(
         swa_model.module.state_dict() if hasattr(swa_model, "module") else swa_model.state_dict(),
         swa_model_path
     )
     logger.info(f"Saved SWA model to {swa_model_path}")
-    
+
     # Save metrics
     test_metrics_path = os.path.join(save_dir, "test_metrics.pkl")
     with open(test_metrics_path, "wb") as f:
         pickle.dump(test_metrics, f)
-    
+
     logger.info("Training completed successfully!")
     return test_metrics
 
@@ -425,16 +428,10 @@ def prepare_merged_dataset(hparams):
     """
     logger.info("Preparing merged dataset (BNCI+Cho+Lee)...")
 
-    paradigm = MotorImagery(
-        fmin=hparams["fmin"],
-        fmax=hparams["fmax"],
-        resample=hparams["sample_rate"],
-    )
     pad_time = 640
-
     merged = []
-    subject_offset = 0
-    subject_to_dataset = {}  # Map subject ID to dataset name
+    subject_offset = 1
+    subject_to_dataset = {}
 
     dataset_root = hparams["data_folder"]
     logger.info(f"Using dataset root: {dataset_root}")
@@ -444,82 +441,102 @@ def prepare_merged_dataset(hparams):
     lee = Lee2019_MI()
 
     dataset_info = [
-        (bnci, "BNCI2014_001"),
-        (cho, "Cho2017"),
-        (lee, "Lee2019_MI")
+        (bnci, "BNCI2014_001", dict(left_hand=0, right_hand=1, feet=2, tongue=2)),
+        (cho, "Cho2017", dict(left_hand=0, right_hand=1)),
+        (lee, "Lee2019_MI", dict(left_hand=0, right_hand=1))
     ]
 
-    for ds, dataset_name in dataset_info:
-      if dataset_name == "BNCI2014_001":
+    for ds, dataset_name, label_map in dataset_info:
+        paradigm = MotorImagery(
+            fmin=hparams["fmin"],
+            fmax=hparams["fmax"],
+            resample=hparams["sample_rate"],
+        )
+
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
-            map_labels=dict(left_hand=0, right_hand=1, feet=2, tongue=2),
             cache_config=hparams.get("cache_config"),
             pad_time=pad_time,
+            map_labels=label_map,
         )
 
-      else:
-        torch_ds = TorchMOABBDataset(
-            dataset=ds,
-            paradigm=paradigm,
-            map_labels=dict(left_hand=0, right_hand=1),
-            cache_config=hparams.get("cache_config"),
-            pad_time=pad_time,
-        )
-        
-      # Track which subjects belong to which dataset
-      subject_start = subject_offset
-      torch_ds._data[2]["subject"] += subject_offset
-      subject_offset = int(torch_ds._data[2]["subject"].max()) + 1
-      subject_end = subject_offset
-        
-      # Map each subject to its dataset
-      for subj_id in range(subject_start, subject_end):
-        subject_to_dataset[subj_id] = dataset_name
-        
-      logger.info(f"{dataset_name}: subjects {subject_start} to {subject_end-1}")
-      merged.append(torch_ds)
+        original_subjects = sorted(torch_ds._data[2]["subject"].unique())
+        unique_subjects = len(original_subjects)
 
-    total_subjects = subject_offset
+        subject_mapping = {
+            old_id: new_id
+            for old_id, new_id in zip(original_subjects, range(subject_offset, subject_offset + unique_subjects))
+        }
+
+        torch_ds._data[2]["subject"] = torch_ds._data[2]["subject"].map(subject_mapping)
+
+        subject_start = subject_offset
+        subject_offset += unique_subjects
+        subject_end = subject_offset
+
+        for subj_id in range(subject_start, subject_end):
+            subject_to_dataset[subj_id] = dataset_name
+
+        logger.info(f"{dataset_name}: {unique_subjects} subjects (IDs {subject_start} to {subject_end-1})")
+        merged.append(torch_ds)
+
+    total_subjects = subject_offset - 1
     hparams["n_subjects"] = total_subjects
-    hparams["subject_to_dataset"] = subject_to_dataset  # Store mapping
-    logger.info(f"Total merged subjects: {total_subjects}")
-    
+    hparams["subject_to_dataset"] = subject_to_dataset
+    logger.info(f"Total merged subjects: {total_subjects} (IDs 1-{total_subjects})")
+
     return ConcatDataset(merged)
 
 
 def prepare_dataset_iterators(hparams):
     """
-    Prepare LOSO dataset splits.
+    Prepare LOSO dataset splits using manual index-based splitting.
     Pure LOSO: train on N-1 subjects, test on 1 subject.
     """
     merged_dataset = prepare_merged_dataset(hparams)
-    
-    data_iterator = LeaveOneSubjectOut(
-        datasets=[merged_dataset],
-        resample=hparams["sample_rate"],
-        fmin=hparams["fmin"],
-        fmax=hparams["fmax"],
-        tmin=hparams["tmin"],
-        tmax=hparams["tmax"],
-        events=hparams.get("events_to_load"),
-        valid_ratio=0.0,  # No validation split - pure LOSO
-        target_subjects=hparams["target_subject_idx"] + 1,
-        target_sessions=hparams["target_session_idx"],
-    )
 
-    datasets = data_iterator.prepare(
-        data_folder=hparams["data_folder"],
-        cached_data_folder=hparams["cached_data_folder"],
-        batch_size=hparams["batch_size"],
-    )
-    
-    logger.info(f"Train set size: {len(datasets['train'].dataset)}")
-    logger.info(f"Test set size: {len(datasets['test'].dataset)}")
-    
+    target_subject = hparams["target_subject_idx"]
+
+    train_indices = []
+    test_indices = []
+
+    if isinstance(merged_dataset, ConcatDataset):
+        cumulative_idx = 0
+        for sub_dataset in merged_dataset.datasets:
+            metadata = sub_dataset._data[2]
+            for local_idx in range(len(sub_dataset)):
+                global_idx = cumulative_idx + local_idx
+                if metadata.iloc[local_idx]["subject"] == target_subject:
+                    test_indices.append(global_idx)
+                else:
+                    train_indices.append(global_idx)
+            cumulative_idx += len(sub_dataset)
+    else:
+        for idx in range(len(merged_dataset)):
+            sample = merged_dataset[idx]
+            if sample.subject == target_subject:
+                test_indices.append(idx)
+            else:
+                train_indices.append(idx)
+
+    logger.info(f"Target subject: {target_subject}")
+    logger.info(f"Train indices: {len(train_indices)}")
+    logger.info(f"Test indices: {len(test_indices)}")
+
+    train_dataset = Subset(merged_dataset, train_indices)
+    test_dataset = Subset(merged_dataset, test_indices)
+
+    datasets = {
+        "train": train_dataset,
+        "test": test_dataset
+    }
+
+    logger.info(f"Train set size: {len(train_dataset)}")
+    logger.info(f"Test set size: {len(test_dataset)}")
+
     tail_path = os.path.join(
-        "cross-ds-loso", f"sub-{str(hparams['target_subject_idx']+1).zfill(3)}"
+        "cross-ds-loso", f"sub-{str(target_subject).zfill(3)}"
     )
     return tail_path, datasets
 
@@ -530,11 +547,11 @@ def load_hparams_and_dataset_iterators(hparams_file, run_opts, overrides):
     """
     with open(hparams_file) as fin:
         hparams = load_hyperpyyaml(fin, overrides)
-    
+
     tail_path, datasets = prepare_dataset_iterators(hparams)
-    overrides.update(n_train_examples=len(datasets["train"].dataset))
+    overrides.update(n_train_examples=len(datasets["train"]))
     hparams["exp_dir"] = os.path.join(hparams["output_folder"], tail_path)
-    
+
     sb.create_experiment_directory(
         experiment_directory=hparams["exp_dir"],
         hyperparams_to_save=hparams_file,
