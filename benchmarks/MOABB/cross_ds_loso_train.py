@@ -26,23 +26,24 @@ from contextlib import redirect_stdout
 import pandas as pd
 from torch.optim.swa_utils import AveragedModel, SWALR
 from sklearn import metrics
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from moabb.datasets import BNCI2014_001, Cho2017, Lee2019_MI
 from moabb.paradigms import MotorImagery
 
-# CRITICAL: Patch MOABB download function to use local files only
+# MOABB local download patch
 import moabb.datasets.download as moabb_dl
 from urllib.parse import urlparse
 
 def local_first_data_dl(url, sign, path=None, force_update=False, verbose=None):
-    """Check if file exists locally before attempting download"""
+    """find files locally before attempting download"""
     parsed = urlparse(url)
     filename = os.path.basename(parsed.path)
 
     if path is None:
         path = os.environ.get('MNE_DATA', os.path.expanduser('~/mne_data'))
 
-    # Construct local path based on dataset type
+    # Construct local path per dataset
     if 'bnci' in url.lower():
         local_path = os.path.join(path, 'MNE-bnci-data', parsed.path.lstrip('/'))
     elif '100542' in url:  # Lee2019_MI specific dataset ID
@@ -68,13 +69,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Device setup - always GPU
+# Device setup 
 DEVICE = torch.device("cuda")
 
-
-# ------------------------------
-# Seed setting for reproducibility
-# ------------------------------
+# Set Seed 
 def set_seed(seed):
     """
     Set random seed for reproducibility across all libraries.
@@ -121,10 +119,12 @@ class TorchMOABBDataset(Dataset):
 
         x = X[index]
         if self.pad_time:
-            assert self.pad_time >= x.shape[1], "Expected T <= pad_time"
-            x = torch.nn.functional.pad(
-                x, (0, self.pad_time - x.shape[1], 0, 0)
-            )
+            if x.shape[1] > self.pad_time:
+                x = x[:, :self.pad_time]
+            elif x.shape[1] < self.pad_time:
+                x = torch.nn.functional.pad(
+                    x, (0, self.pad_time - x.shape[1], 0, 0)
+                )
 
         return Data(
             x=x,
@@ -191,16 +191,13 @@ def prepare_dataloaders(datasets, batch_size):
         datasets["train"],
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
+        num_workers=0,
     )
     test_loader = DataLoader(
         datasets["test"],
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=0,
     )
 
     logger.info(f"Train batches: {len(train_loader)}")
@@ -209,7 +206,7 @@ def prepare_dataloaders(datasets, batch_size):
     return train_loader, test_loader
 
 
-def compute_class_weights(train_dataset, n_classes):
+def compute_class_weights(train_dataset, n_classes, max_weight_ratio=2.5):
     """
     Compute class weights for balanced loss.
     """
@@ -225,7 +222,7 @@ def compute_class_weights(train_dataset, n_classes):
             train_dataset[i].y.item() for i in range(len(train_dataset))
         ]
     
-    # Compute class counts using pandas
+    # Compute class counts 
     class_counts = pd.Series(train_labels).value_counts().sort_index()
     
     # Ensure all classes are present
@@ -235,8 +232,14 @@ def compute_class_weights(train_dataset, n_classes):
                 class_counts.loc[cls] = 0
     class_counts = class_counts.sort_index()
     
-    # Compute weights: normalized frequency
-    class_weights = class_counts / class_counts.max()
+    # Compute weights
+    class_weights = class_counts.max()/class_counts
+    
+    # Cap the maximum weight ratio
+    min_weight = class_weights.min()
+    max_allowed_weight = min_weight * max_weight_ratio
+    class_weights = class_weights.clip(upper=max_allowed_weight)
+    
     class_weights = torch.from_numpy(class_weights.values).float().to(DEVICE)
     
     logger.info(f"Class weights: {class_weights.cpu().numpy()}")
@@ -244,14 +247,14 @@ def compute_class_weights(train_dataset, n_classes):
 
 
 # ------------------------------
-# Training function with SWA
+# Training function with SWA and Profiler
 # ------------------------------
 def run_model(hparams, run_opts, datasets):
     """
-    Standalone training loop with SWA support for LOSO.
+    Standalone training loop with SWA support and profiling for LOSO.
     SWA is always enabled.
     """
-    # Set random seed for reproducibility
+    # Set random seed 
     seed = hparams.get("seed", 1234)
     set_seed(seed)
 
@@ -262,9 +265,11 @@ def run_model(hparams, run_opts, datasets):
         datasets, hparams["batch_size"]
     )
 
-    # Compute class weights
+    # Compute class weights 
     class_weights = compute_class_weights(
-        datasets["train"], hparams["n_classes"]
+        datasets["train"], 
+        hparams["n_classes"],
+        max_weight_ratio=hparams.get("max_weight_ratio", 2.5)
     )
 
     # Initialize model
@@ -277,7 +282,7 @@ def run_model(hparams, run_opts, datasets):
         optimizer, T_max=hparams["number_of_epochs"]
     )
 
-    # SWA setup (always enabled)
+    # SWA setup
     swa_start_ratio = hparams.get("swa_start_ratio", 0.75)
     swa_start = 1 + int(swa_start_ratio * hparams["number_of_epochs"])
     swa_lr = hparams.get("swa_lr", 0.05)
@@ -295,6 +300,15 @@ def run_model(hparams, run_opts, datasets):
     # Loss function
     loss_fn = hparams["loss"]
 
+    # Profiler setup
+    enable_profiling = hparams.get("enable_profiling", False)
+    profile_epochs = hparams.get("profile_epochs", [5, 10])  
+    
+    if enable_profiling:
+        logger.info(f"Profiling enabled for epochs: {profile_epochs}")
+        prof_output_dir = os.path.join(hparams["exp_dir"], "profiler_traces")
+        os.makedirs(prof_output_dir, exist_ok=True)
+
     # Training loop
     gradient_accumulation = hparams.get("gradient_accumulation", 4)
     logger.info(f"Starting training with gradient accumulation steps: {gradient_accumulation}")
@@ -304,25 +318,86 @@ def run_model(hparams, run_opts, datasets):
         running_loss = 0.0
         num_batches = 0
 
+        # Check if profile active this epoch
+        should_profile = enable_profiling and epoch in profile_epochs
+        
+        if should_profile:
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(
+                    wait=2,      # Skip first 2 batches
+                    warmup=2,    # Warmup for 2 batches  
+                    active=5,    # Profile 5 batches
+                    repeat=1     # Do this once per epoch
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(prof_output_dir)
+            )
+            prof.start()
+            logger.info(f"Started profiling for epoch {epoch} (wait=2, warmup=2, active=5)")
+
         optimizer.zero_grad()
         for idx, batch in enumerate(train_loader):
-            # Move batch to device
-            batch = batch.to(DEVICE)
+            if should_profile:
+                with record_function("data_loading"):
+                    batch = batch.to(DEVICE)
+            else:
+                batch = batch.to(DEVICE)
 
             # Forward pass
-            output = model(batch)
-            loss = loss_fn(output, batch.y, weight=class_weights)
+            if should_profile:
+                with record_function("forward_pass"):
+                    output = model(batch)
+                with record_function("loss_computation"):
+                    loss = loss_fn(output, batch.y, weight=class_weights)
+            else:
+                output = model(batch)
+                loss = loss_fn(output, batch.y, weight=class_weights)
 
             # Backward pass
-            loss.backward()
+            if should_profile:
+                with record_function("backward_pass"):
+                    loss.backward()
+            else:
+                loss.backward()
 
             running_loss += loss.item()
             num_batches += 1
 
             # Update weights every gradient_accumulation batches
-            if idx % gradient_accumulation == gradient_accumulation - 1:
-                optimizer.step()
-                optimizer.zero_grad()
+            if (idx + 1) % gradient_accumulation == 0:
+                if should_profile:
+                    with record_function("optimizer_step"):
+                        optimizer.step()
+                        optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    optimizer.zero_grad()
+            
+            if should_profile:
+                prof.step()
+
+        # check for remaining gradients
+        if num_batches % gradient_accumulation != 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        if should_profile:
+            prof.stop()
+            logger.info(f"Profiling completed for epoch {epoch}")
+            logger.info(f"Trace saved to: {prof_output_dir}")
+            
+            # Print summary to console
+            logger.info("\n" + "="*80)
+            logger.info("PROFILER SUMMARY (Top 10 operations by CUDA time)")
+            logger.info("="*80)
+            print(prof.key_averages().table(
+                sort_by="cuda_time_total", 
+                row_limit=10
+            ))
+            logger.info("="*80 + "\n")
 
         # Calculate average loss
         avg_loss = running_loss / num_batches
@@ -344,11 +419,12 @@ def run_model(hparams, run_opts, datasets):
 
     logger.info("Using SWA model for evaluation")
 
-    # Evaluate on test set (left-out subject)
-    logger.info("Evaluating on test set (left-out subject)...")
+    # Evaluate on test set (left-out subjecta fold)
+    logger.info("Evaluating on test set (left-out subjects)...")
     swa_model.eval()
     y_true_all = []
     y_pred_all = []
+    subject_ids = []
 
     with torch.no_grad():
         for batch in test_loader:
@@ -356,13 +432,16 @@ def run_model(hparams, run_opts, datasets):
             output = swa_model(batch)
             y_pred = torch.argmax(output, dim=-1).cpu().numpy()
             y_true = batch.y.cpu().numpy()
+            subjects = np.array(batch.subject)
 
             y_true_all.extend(y_true)
             y_pred_all.extend(y_pred)
+            subject_ids.extend(subjects)
 
-    # Compute metrics
+    # Compute overall metrics
     y_true_all = np.array(y_true_all)
     y_pred_all = np.array(y_pred_all)
+    subject_ids = np.array(subject_ids)
 
     test_metrics = {}
     for metric_name, metric_func in hparams["metrics"].items():
@@ -371,16 +450,37 @@ def run_model(hparams, run_opts, datasets):
         else:
             test_metrics[metric_name] = metric_func(y_true=y_true_all, y_pred=y_pred_all)
 
-    logger.info(f"Test metrics: {test_metrics}")
+    logger.info(f"Overall test metrics: {test_metrics}")
 
-    # Get dataset name for this subject
-    target_subject = hparams["target_subject_idx"]
-    dataset_name = hparams["subject_to_dataset"].get(target_subject, "Unknown")
-    logger.info(f"Left-out subject {target_subject} is from dataset: {dataset_name}")
+    # Compute per-dataset metrics
+    fold_idx = hparams["target_subject_idx"]
+    test_subjects = {
+        "BNCI2014_001": fold_idx,
+        "Cho2017": 9 + fold_idx,
+        "Lee2019_MI": 18 + fold_idx
+    }
 
-    # Add dataset info to metrics
-    test_metrics["subject_id"] = target_subject
-    test_metrics["dataset_name"] = dataset_name
+    per_dataset_metrics = {}
+    for dataset_name, subject_id in test_subjects.items():
+        mask = subject_ids == subject_id
+        if mask.sum() > 0:
+            y_true_subset = y_true_all[mask]
+            y_pred_subset = y_pred_all[mask]
+            
+            dataset_metrics = {}
+            for metric_name, metric_func in hparams["metrics"].items():
+                if metric_name == "cm":
+                    dataset_metrics[metric_name] = metric_func(y_true_subset, y_pred_subset).tolist()
+                else:
+                    dataset_metrics[metric_name] = metric_func(y_true=y_true_subset, y_pred=y_pred_subset)
+            
+            per_dataset_metrics[dataset_name] = dataset_metrics
+            logger.info(f"{dataset_name} (subject {subject_id}) metrics: {dataset_metrics}")
+
+    # Add per-dataset metrics to overall results
+    test_metrics["per_dataset"] = per_dataset_metrics
+    test_metrics["fold_idx"] = fold_idx
+    test_metrics["test_subjects"] = test_subjects
 
     # Save results
     save_dir = os.path.join(hparams["exp_dir"], "save")
@@ -409,10 +509,11 @@ def run_model(hparams, run_opts, datasets):
 def prepare_merged_dataset(hparams):
     """
     Prepare and merge BNCI, Cho, and Lee datasets.
+    Uses first 9 subjects from each dataset for balanced representation.
     """
-    logger.info("Preparing merged dataset (BNCI+Cho+Lee)...")
+    logger.info("Preparing merged dataset (BNCI+Cho+Lee) - First 9 subjects from each...")
 
-    pad_time = 640
+    pad_time = hparams["T"]
     merged = []
     subject_offset = 1
     subject_to_dataset = {}
@@ -425,21 +526,26 @@ def prepare_merged_dataset(hparams):
     lee = Lee2019_MI()
 
     dataset_info = [
-        (bnci, "BNCI2014_001", dict(left_hand=0, right_hand=1, feet=2, tongue=2)),
-        (cho, "Cho2017", dict(left_hand=0, right_hand=1)),
-        (lee, "Lee2019_MI", dict(left_hand=0, right_hand=1))
+        (bnci, "BNCI2014_001", dict(left_hand=0, right_hand=1, feet=2, tongue=2), 9),
+        (cho, "Cho2017", dict(left_hand=0, right_hand=1), 9),
+        (lee, "Lee2019_MI", dict(left_hand=0, right_hand=1), 9)
     ]
 
-    for ds, dataset_name, label_map in dataset_info:
+    for ds, dataset_name, label_map, num_subjects in dataset_info:
         paradigm = MotorImagery(
             fmin=hparams["fmin"],
             fmax=hparams["fmax"],
             resample=hparams["sample_rate"],
         )
 
+        # Get only first num_subjects subjects
+        available_subjects = ds.subject_list[:num_subjects]
+        logger.info(f"{dataset_name}: Using first {num_subjects} subjects: {available_subjects}")
+
         torch_ds = TorchMOABBDataset(
             dataset=ds,
             paradigm=paradigm,
+            subjects=available_subjects,
             cache_config=hparams.get("cache_config"),
             pad_time=pad_time,
             map_labels=label_map,
@@ -475,12 +581,30 @@ def prepare_merged_dataset(hparams):
 
 def prepare_dataset_iterators(hparams):
     """
-    Prepare LOSO dataset splits using manual index-based splitting.
-    Pure LOSO: train on N-1 subjects, test on 1 subject.
+    Prepare balanced LOSO dataset splits.
+    Each fold leaves out the Nth subject from each dataset.
+    
+    target_subject_idx 1-9 maps to folds 1-9:
+    Fold 1: Leave out subject 1 from BNCI, Cho, Lee (subjects 1, 10, 19)
+    Fold 2: Leave out subject 2 from BNCI, Cho, Lee (subjects 2, 11, 20)
+    ...
+    Fold 9: Leave out subject 9 from BNCI, Cho, Lee (subjects 9, 18, 27)
     """
     merged_dataset = prepare_merged_dataset(hparams)
 
-    target_subject = hparams["target_subject_idx"]
+    fold_idx = hparams["target_subject_idx"]  
+    
+    # Validate fold index
+    if fold_idx < 1 or fold_idx > 9:
+        raise ValueError(f"target_subject_idx must be between 1-9, got {fold_idx}")
+    
+    # Calculate which subjects to leave out
+    # BNCI: subjects 1-9, Cho: subjects 10-18, Lee: subjects 19-27
+    bnci_subject = fold_idx
+    cho_subject = 9 + fold_idx
+    lee_subject = 18 + fold_idx
+    
+    test_subjects = [bnci_subject, cho_subject, lee_subject]
 
     train_indices = []
     test_indices = []
@@ -491,7 +615,8 @@ def prepare_dataset_iterators(hparams):
             metadata = sub_dataset._data[2]
             for local_idx in range(len(sub_dataset)):
                 global_idx = cumulative_idx + local_idx
-                if metadata.iloc[local_idx]["subject"] == target_subject:
+                subject_id = metadata.iloc[local_idx]["subject"]
+                if subject_id in test_subjects:
                     test_indices.append(global_idx)
                 else:
                     train_indices.append(global_idx)
@@ -499,12 +624,13 @@ def prepare_dataset_iterators(hparams):
     else:
         for idx in range(len(merged_dataset)):
             sample = merged_dataset[idx]
-            if sample.subject == target_subject:
+            if sample.subject in test_subjects:
                 test_indices.append(idx)
             else:
                 train_indices.append(idx)
 
-    logger.info(f"Target subject: {target_subject}")
+    logger.info(f"Fold {fold_idx}/9 (target_subject_idx={fold_idx})")
+    logger.info(f"Test subjects: BNCI={bnci_subject}, Cho={cho_subject}, Lee={lee_subject}")
     logger.info(f"Train indices: {len(train_indices)}")
     logger.info(f"Test indices: {len(test_indices)}")
 
@@ -520,7 +646,7 @@ def prepare_dataset_iterators(hparams):
     logger.info(f"Test set size: {len(test_dataset)}")
 
     tail_path = os.path.join(
-        "cross-ds-loso", f"sub-{str(target_subject).zfill(3)}"
+        "cross-ds-balanced-loso", f"fold-{str(fold_idx).zfill(2)}"
     )
     return tail_path, datasets
 
@@ -547,7 +673,7 @@ def load_hparams_and_dataset_iterators(hparams_file, run_opts, overrides):
 if __name__ == "__main__":
     argv = sys.argv[1:]
     hparams_file, run_opts, overrides = sb.core.parse_arguments(argv)
-    overrides = yaml.load(overrides, yaml.SafeLoader)
+    yaml.safe_load(overrides)
     hparams, datasets = load_hparams_and_dataset_iterators(
         hparams_file, run_opts, overrides
     )
