@@ -1,7 +1,6 @@
 #!/usr/bin/python
 """
-Cross-dataset training with leave-one-subject-out (LOSO) and SWA support.
-Uses standalone training loop instead of SpeechBrain Brain class.
+Cross-dataset training with left out subjects from each dataset and SWA support
 """
 
 import os
