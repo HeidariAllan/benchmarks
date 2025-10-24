@@ -7,7 +7,7 @@ Uses standalone training loop instead of SpeechBrain Brain class.
 import os
 import sys
 
-# CRITICAL: Set MNE_DATA before importing MOABB to use local datasets
+# Set MNE_DATA before importing MOABB to use local datasets
 os.environ['MNE_DATA'] = os.environ.get('SLURM_TMPDIR', '/tmp') + '/mne_data'
 
 import logging
