@@ -2,7 +2,8 @@ seed: 1234
 __set_torchseed: !apply:torch.manual_seed [!ref <seed>]
 
 # DIRECTORIES
-data_folder: /localscratch/allanh.${SLURM_JOBID}.0/eeg_data
+#data_folder: /localscratch/allanh.${SLURM_JOBID}.0/eeg_data
+data_folder: /localscratch/allanh.${SLURM_JOBID}.0/mne_data
 cached_data_folder: /localscratch/allanh.${SLURM_JOBID}.0/eeg_cache
 
 output_folder: !PLACEHOLDER
@@ -11,27 +12,28 @@ cache_config:
   save_epochs: true
   use: true
 data_iterator_name: leave-one-subject-out
-target_subject_idx: !PLACEHOLDER
-target_session_idx: !PLACEHOLDER
+#target_subject_idx: !PLACEHOLDER
+#target_session_idx: !PLACEHOLDER
+target_subject_idx: 0
+target_session_idx: 0
 sample_rate: 128 # Target sampling rate (Hz)
 # band-pass filtering cut-off frequencies
 fmin: 0.13
 fmax: 46.0
-n_classes: 3
+n_classes: 4
 map_labels:
   left_hand: 0
   right_hand: 1
   _default: 2
 tmin: 0.
-tmax: 4.0
+tmax: 5.0
 paradigm: !name:moabb.paradigms.MotorImagery
   tmin: !ref <tmin>
   tmax: !ref <tmax>
   fmin: !ref <fmin>
   fmax: !ref <fmax>
   resample: !ref <sample_rate>
-T: !apply:math.ceil
-  - !ref <sample_rate> * (<tmax> - <tmin>)
+T: 640
 
 test_with: "last"
 test_key: "acc"
@@ -45,6 +47,11 @@ metrics:
   f1: !ref <f1>
   acc: !ref <acc>
   cm: !ref <cm>
+
+channel_dropout: 0.0  # Drop 10% of electrode channels during training
+gradient_accumulation: 3
+swa_start_ratio: 0.9
+use_balanced_sampling: True
 
 # TRAINING HPARS
 n_train_examples: 100
@@ -68,7 +75,7 @@ optimizer: !name:torch.optim.Adam
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
   limit: !new:int
     - !ref <number_of_epochs>
-batch_size_exponent: 4 #changed from 3
+batch_size_exponent: 4 #changed from 4
 batch_size: !ref 2 ** <batch_size_exponent>
 valid_ratio: 0.2
 
@@ -99,7 +106,7 @@ add_noise_white: !new:speechbrain.augment.time_domain.AddNoise
   snr_high: !ref <snr_white_high>
 position_noise_sigma: 0.1
 
-repeat_augment: 0
+repeat_augment: 1
 graph_augment: !new:torch.nn.Sequential
   - !new:utils.graph_iterators.PositionNoise
     sigma: !ref <position_noise_sigma>
@@ -122,8 +129,10 @@ normalize: !name:speechbrain.processing.signal_processing.mean_std_norm
   dims: !ref <dims_to_normalize>
 pos_normalize: True
 
+pretrained_checkpoint: null
+
 # MODEL
-projection_dim: 22
+projection_dim: 29
 spatial_focus_tau: 0.3333
 
 input_shape: [null, !ref <T>, !ref <projection_dim>, null]
